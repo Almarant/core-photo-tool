@@ -149,11 +149,35 @@ def detect(path):
 
 
 def crop_box(d, p: Params):
-    """Crop rectangle in detection-pixel coordinates."""
+    """Auto-detected crop rectangle, in detection-pixel coordinates."""
     x0, y0, x1, y1 = d["bb"]
     xc = 0.5 * (x0 + x1)
     return (xc - p.tray_width / 2 - p.pad_x, d["bar"] - p.pad_top,
             xc + p.tray_width / 2 + p.pad_x, y1 + p.pad_bottom)
+
+
+def crop_quad(d, p: Params, adj=None):
+    """The four corners actually used for the crop: tl, tr, br, bl.
+
+    `adj` is four (dx, dy) offsets in detection pixels, one per corner, from
+    dragging the handles in the app. A quad rather than a rectangle because a
+    photo taken slightly off-centre keystones the tray - opposite edges are not
+    parallel - and no rectangle can sit on all four sides at once. Warping a
+    quad onto a rectangle rectifies that.
+    """
+    bx0, by0, bx1, by1 = crop_box(d, p)
+    q = np.array([[bx0, by0], [bx1, by0], [bx1, by1], [bx0, by1]], np.float32)
+    if adj:
+        q = q + np.asarray(adj, np.float32)
+    return q
+
+
+def out_size(d, p: Params):
+    """Output canvas, derived from the AUTO box so millimetres-per-pixel stay
+    constant no matter how the user nudges the corners."""
+    bx0, by0, bx1, by1 = crop_box(d, p)
+    return (int(round((bx1 - bx0) * RED * p.scale)),
+            int(round((by1 - by0) * RED * p.scale)))
 
 
 # ----------------------------------------------------------- normalisation
@@ -196,17 +220,16 @@ def core_stats(crop):
     return (float(np.median(L[rock])), float(np.median(np.sqrt(a * a + b * b)[rock])), fill)
 
 
-def render(path, d, p: Params):
+def render(path, d, p: Params, adj=None):
     """Full-resolution crop. Returns (image, gains)."""
-    bx0, by0, bx1, by1 = crop_box(d, p)
-    sc = p.scale
-    OW = int(round((bx1 - bx0) * RED * sc))
-    OH = int(round((by1 - by0) * RED * sc))
+    OW, OH = out_size(d, p)
+    quad = crop_quad(d, p, adj) * RED          # deskewed full-resolution coords
+    dst = np.array([[0, 0], [OW, 0], [OW, OH], [0, OH]], np.float32)
     full = cv2.imread(path, cv2.IMREAD_COLOR)
     fh, fw = full.shape[:2]
     R = np.vstack([cv2.getRotationMatrix2D((fw / 2, fh / 2), d["angle"], 1.0), [0, 0, 1]])
-    S = np.array([[sc, 0, -sc * bx0 * RED], [0, sc, -sc * by0 * RED], [0, 0, 1]], float)
-    crop = cv2.warpPerspective(full, S @ R, (OW, OH), flags=cv2.INTER_AREA,
+    P = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
+    crop = cv2.warpPerspective(full, P @ R, (OW, OH), flags=cv2.INTER_AREA,
                                borderMode=cv2.BORDER_CONSTANT, borderValue=PAD_COLOR)
     gains = None
     if p.normalise:

@@ -19,15 +19,38 @@ Output: `DD26ZOP-006_Dry_Tray22_82.50-86.00m.jpg`
    never modified.
 3. **Step 2 – Check the crop.** Look at the red box on a few photos. It should
    sit on top of the label bar, on the tray's bottom rail, and on the tray ends.
-   If it is consistently too wide or narrow, drag the **Tray width** slider until
-   it fits. Flick through with **Next** to confirm.
-4. **Step 3 – Labels and run.** For each tray you get its label bar shown large.
-   Type the **tray number** and **end depth**. Enter the start depth of the first
-   tray once — every later tray starts where the previous one ended. Press
-   **Check** to catch typos, then **Process and save**.
+
+   - Consistently too wide or narrow across the whole batch → drag the
+     **Tray width** slider.
+   - One photo off, or the tray looks keystoned because the camera was not quite
+     square to it → **drag the yellow corner handles**. Each corner moves
+     independently, so you can match a trapezoid; the crop then warps it back to
+     a rectangle. Drag inside the box to move the whole thing.
+   - **Copy this adjustment to every photo in the folder** applies the same nudge
+     to the batch, for a rig that is consistently off rather than one bad photo.
+   - **Undo my corner changes on this photo** puts a single photo back to auto.
+
+   Adjusting corners does not change the output size, so millimetres-per-pixel
+   stays identical across the whole set. Photos you adjusted are flagged
+   `corners_adjusted` in the manifest.
+4. **Step 3 – Labels and run.** One row per photo, each showing its label bar
+   enlarged. Fill in the **tray number** and **end depth**, and enter the start
+   depth of the first tray once — every later tray starts where the previous one
+   ended, so you only type one depth per tray.
+
+   Two rows sharing a tray number are that tray's dry and wet shots. If someone
+   reshot a tray, just correct the tray numbers; nothing downstream shifts.
+   **Dry / Wet** is decided automatically from brightness, and the dropdown lets
+   you override it when the call was close.
+
+   Press **Check** to catch typos, then **Process and save all folders** — every
+   hole you scanned is processed in one go.
 
 You get one folder per hole, split into `Dry` and `Wet`, plus a `manifest.csv`
-recording every decision.
+per hole recording every decision.
+
+**Amber boxes** are depths OCR guessed and nobody has checked yet. Clicking or
+typing in one clears the amber. The app warns before saving if any are left.
 
 Read **PHOTO_SOP.md** before your next shift at the core shed. Most of the
 quality is decided by how the photos are taken, not by this tool.
@@ -57,15 +80,20 @@ rather than geology. It never references the core itself: doing that would
 flatten genuine lithological brightness differences, which is usually the signal
 you care about. It never touches contrast or saturation.
 
-**Decides dry vs wet** by comparing the two photos of each tray: the darker core
-is wet. Shooting order is *not* used — photographers sometimes shoot wet first.
-Pairs that come out nearly equal in brightness (usually a near-empty tray) are
-flagged `check` in the manifest.
+**Decides dry vs wet** by comparing the photos of each tray: the darker core is
+wet. Shooting order is *not* used — photographers sometimes shoot wet first.
+Close calls (usually a near-empty tray) are flagged `check` in the manifest, and
+the Dry/Wet dropdown overrides the decision on any row.
+
+**Groups photos by the tray number you enter**, not by adjacency. Adjacency is
+tempting since a tray's two shots are always next to each other, but one reshoot
+then shifts every later pair and silently puts the wrong depths on the rest of
+the hole.
 
 **Validates depths** before writing anything: tray numbers consecutive, depths
 strictly increasing, intervals plausible, two photos per tray.
 
-### Why you type the depths instead of OCR reading them
+### Why OCR only suggests, never decides
 
 We measured it. Tesseract over 72 real DD26ZOP labels got the hole ID right 36%
 of the time, the tray number 59%, and the end depth 67%. The stencil font, the
@@ -73,10 +101,16 @@ dark rusty bar and the raised-dot decimal (`86·00` reads as `86-00`) all hurt i
 A wrong depth in a filename propagates silently into Leapfrog, so that accuracy
 is worse than useless.
 
-If Tesseract *is* installed and on PATH the app will pre-fill the fields as a
-hint, but the numbers are always shown next to the enlarged label bar for you to
-confirm, and the whole depth sequence is validated before anything is written.
-That is more reliable than either OCR or blind typing.
+So OCR is pre-fill only. Tesseract is bundled into the .exe, and the app reads
+just the depth digits, then uses the depth sequence to repair the most common
+failure — a dropped leading digit (110.75 read as 10.75), which breaks
+monotonicity and so can be detected and often fixed automatically.
+
+Measured over 72 labels, that combination gives **57% filled correctly, 38% left
+blank, 6% confidently wrong**. That last 6% is why nothing is auto-accepted:
+errors like 22.90 read as 22.3 stay in sequence and look plausible. Every OCR
+value is shown in amber next to the enlarged label bar until a human passes over
+it, and the whole depth sequence is validated before anything is written.
 
 ---
 
@@ -84,9 +118,10 @@ That is more reliable than either OCR or blind typing.
 
 ```
 corephoto/core.py     detection, deskew, crop, colour normalisation, rock stats
-corephoto/naming.py   pairing, dry/wet, depth chaining, filenames, validation
-corephoto/ocr.py      optional Tesseract pre-fill
-corephoto/app.py      tkinter GUI
+corephoto/naming.py   grouping, dry/wet, depth chaining, filenames, validation
+corephoto/ocr.py      Tesseract pre-fill + sequence-based repair
+corephoto/app.py      tkinter GUI (sv_ttk theme)
+corephoto/icon.ico    app icon
 tests/test_logic.py   pure-logic checks, run by CI
 ```
 

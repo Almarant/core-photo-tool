@@ -1,37 +1,51 @@
-# Putting this on GitHub (one time, ~5 minutes)
+# Putting this on GitHub
 
-The point: colleagues download a .exe from the Releases page. Nobody needs
-Python, and the build keeps working after whoever set it up has moved on.
+> **If you upload by dragging files into the browser, the `.github` folder is
+> silently skipped.** Browsers exclude dot-folders from folder drops. Without it
+> there is no workflow, so no automatic Windows build ever runs — and no `.exe`.
+> Use git (below), or create that one file by hand afterwards.
 
-1. Create an empty repository on GitHub — private is fine.
-   Do **not** let it add a README or .gitignore; this folder already has them.
+## The easy way: push_to_github.bat
 
-2. In this folder:
+Edit `REPO_URL` at the top of `push_to_github.bat`, save, double-click. It
+initialises the repo, builds on top of anything already there, pushes `main`,
+and tags `v1.0.0` so you get a Releases page. Needs git installed
+(https://git-scm.com/download/win).
 
-   ```bash
-   git init
-   git add .
-   git commit -m "Core Photo Tool"
-   git branch -M main
-   git remote add origin https://github.com/<org-or-user>/<repo>.git
-   git push -u origin main
-   ```
+## By hand
 
-3. Watch the **Actions** tab. The "Build Windows app" workflow runs on Windows
-   and produces `CorePhotoTool.exe`. First run takes ~4 minutes.
+```bash
+git init
+git add .
+git commit -m "Core Photo Tool"
+git branch -M main
+git remote add origin https://github.com/<user>/<repo>.git
+git fetch origin main && git reset --soft FETCH_HEAD    # only if the repo already has commits
+git add -A && git commit -m "Core Photo Tool"
+git push -u origin main
+git tag v1.0.0 && git push --tags
+```
 
-4. Cut a version so people have a stable download link:
+## If you already uploaded through the browser and the build never ran
 
-   ```bash
-   git tag v1.0.0
-   git push --tags
-   ```
+You are missing exactly one file. On the repo page:
 
-   The .exe, README and PHOTO_SOP now appear on the **Releases** page. Send
-   colleagues that link.
+1. **Add file → Create new file**
+2. In the filename box type `.github/workflows/build-windows.yml` — typing the
+   slashes creates the folders.
+3. Paste the contents of `.github/workflows/build-windows.yml` from this zip.
+4. Commit.
 
-That is all. Any future change pushed to `main` rebuilds automatically; tag it
-when you want a new release.
+The build starts immediately. Watch the **Actions** tab; ~4 minutes.
 
-Note: GitHub Actions is free for public repos and has a free monthly allowance
-for private ones. This build uses a couple of minutes per run.
+## Getting a Releases page
+
+Until you tag a version, the `.exe` only exists as an Actions artifact, which is
+awkward to find. Tag it:
+
+```bash
+git tag v1.0.0
+git push --tags
+```
+
+Actions is free for public repos; this build uses a couple of minutes per run.
