@@ -14,9 +14,12 @@ Output: `DD26ZOP-006_Dry_Tray22_82.50-86.00m.jpg`
 
 1. Download **CorePhotoTool.exe** from the
    [Releases page](../../releases) and double-click it. Nothing to install.
-2. **Step 1 – Folders.** Pick the folder holding your photos (one subfolder per
-   hole) and where to save results. Press **Scan photos**. Your originals are
-   never modified.
+2. **Step 1 – Photos.** Add what you want to process: **drag folders or
+   individual photos onto the list**, or use **Add folder…** / **Add files…**.
+   Mix both freely — a whole hole plus one stray reshoot is fine, and processing
+   a single photo out of a folder of hundreds works. **Remove** takes items back
+   off the list. Choose where to save, then press **Scan photos**. Your originals
+   are never modified.
 3. **Step 2 – Check the crop.** Look at the red box on a few photos. It should
    sit on top of the label bar, on the tray's bottom rail, and on the tray ends.
 
@@ -49,8 +52,15 @@ Output: `DD26ZOP-006_Dry_Tray22_82.50-86.00m.jpg`
 You get one folder per hole, split into `Dry` and `Wet`, plus a `manifest.csv`
 per hole recording every decision.
 
-**Amber boxes** are depths OCR guessed and nobody has checked yet. Clicking or
-typing in one clears the amber. The app warns before saving if any are left.
+**The depth boxes come pre-filled** wherever the app could read the label bar —
+about 9 out of 10 in testing. They appear in **amber**, meaning read by machine
+and not yet checked by a person. Click or type in a box and the amber clears.
+The app warns before saving if any amber is left.
+
+Both photos of a tray get the same depth, so one readable shot covers its
+partner. Where the app is unsure it leaves the box empty rather than guessing —
+an empty box costs you ten seconds, a wrong depth in a filename does not
+announce itself.
 
 Read **PHOTO_SOP.md** before your next shift at the core shed. Most of the
 quality is decided by how the photos are taken, not by this tool.
@@ -93,24 +103,52 @@ the hole.
 **Validates depths** before writing anything: tray numbers consecutive, depths
 strictly increasing, intervals plausible, two photos per tray.
 
-### Why OCR only suggests, never decides
+### Reading the label bar
 
-We measured it. Tesseract over 72 real DD26ZOP labels got the hole ID right 36%
-of the time, the tray number 59%, and the end depth 67%. The stencil font, the
-dark rusty bar and the raised-dot decimal (`86·00` reads as `86-00`) all hurt it.
-A wrong depth in a filename propagates silently into Leapfrog, so that accuracy
-is worse than useless.
+**There is no OCR engine to install.** The label characters are a fixed set of
+physical stencil tiles — the same glyphs in every photo — so the app carries its
+own digit reader (`corephoto/glyphs.py`, ~15 KB of templates) rather than a
+general OCR engine.
 
-So OCR is pre-fill only. Tesseract is bundled into the .exe, and the app reads
-just the depth digits, then uses the depth sequence to repair the most common
-failure — a dropped leading digit (110.75 read as 10.75), which breaks
-monotonicity and so can be detected and often fixed automatically.
+That decision was measured, not assumed. Over 72 real DD26ZOP labels:
 
-Measured over 72 labels, that combination gives **57% filled correctly, 38% left
-blank, 6% confidently wrong**. That last 6% is why nothing is auto-accepted:
-errors like 22.90 read as 22.3 stay in sequence and look plausible. Every OCR
-value is shown in amber next to the enlarged label bar until a human passes over
-it, and the whole depth sequence is validated before anything is written.
+| reader | correct | blank | **wrong** |
+|---|---|---|---|
+| Tesseract, best configuration | 38% | 56% | **6%** |
+| built-in digit reader | 93% | 7% | **0%** |
+
+A general OCR engine has to cope with any font; recognising one known alphabet is
+a far easier problem, and it needs no installation and adds no 50 MB to the
+download.
+
+Three things keep the error rate at zero, and all of them prefer an empty box to
+a guess:
+
+- **Confidence gates.** A character is only accepted if it is clearly closer to
+  one digit than any other. Across every correct read the worst decision margin
+  was 10.4; the misreads sat at 3.9–5.0. The threshold sits between them.
+- **The depth sequence vetoes, it never invents.** A reading that would go
+  backwards or jump implausibly is discarded. An earlier version tried to
+  *repair* such readings from the sequence and turned an obviously-wrong 7.5 into
+  a plausible-looking 67.5 — much harder for a human to catch. Rejecting is the
+  safer failure.
+- **Nothing is auto-accepted.** Every value appears in amber next to the enlarged
+  label bar until you pass over the field, and the app warns before saving if any
+  amber is left.
+
+Tesseract is still used as a fallback if it happens to be installed, and for the
+hole ID and tray number, which are letters rather than digits.
+
+**If the stencil kit ever changes** and depths start coming up blank, retrain
+from photos you have already processed correctly:
+
+```bash
+python tools/train_glyphs.py path/to/processed -o glyph_templates.npz
+```
+
+It labels each character from the depth in the filename, refuses to learn from
+photos it cannot segment confidently, and reports how many examples it found per
+digit. Copy the result over `corephoto/glyph_templates.npz`.
 
 ---
 
@@ -119,9 +157,13 @@ it, and the whole depth sequence is validated before anything is written.
 ```
 corephoto/core.py     detection, deskew, crop, colour normalisation, rock stats
 corephoto/naming.py   grouping, dry/wet, depth chaining, filenames, validation
-corephoto/ocr.py      Tesseract pre-fill + sequence-based repair
+corephoto/glyphs.py   built-in digit reader (locate, segment, classify)
+corephoto/glyph_templates.npz   digit templates, trained on this project's labels
+corephoto/ocr.py      reader dispatch + depth-sequence veto; optional Tesseract
 corephoto/app.py      tkinter GUI (sv_ttk theme)
 corephoto/icon.ico    app icon
+corephoto/settings.py remembered preferences
+tools/train_glyphs.py retrain the digit reader if the stencil kit changes
 tests/test_logic.py   pure-logic checks, run by CI
 ```
 
@@ -131,6 +173,16 @@ Run from source:
 pip install -r requirements.txt
 python run_app.py
 ```
+
+Depth reading works from source too — the digit reader is part of the package,
+so there is nothing extra to install.
+
+Tesseract is optional and only used as a fallback, plus for the hole ID and tray
+number. If you want it, run `install_tesseract.bat`. The app looks for it in the
+copy bundled in the .exe → a path you chose with **Locate tesseract.exe…**
+(remembered in `%LOCALAPPDATA%\CorePhotoTool\settings.json`) → `PATH` → the
+usual Windows install folders → the registry. The Windows installer often does
+*not* add it to `PATH`, which is why checking `PATH` alone is not enough.
 
 Builds are automatic. Push to `main` and GitHub Actions produces
 `CorePhotoTool.exe` under the run's Artifacts. To cut a release:

@@ -38,11 +38,21 @@ def main():
     p = naming.validate("H1", {1: ["a", "b"], 2: ["c", "d"]}, {1: 3.5, 2: 7.1}, 0.0)
     assert p == [], p
 
-    # a dropped leading digit is repairable from the sequence; ambiguity is not
-    assert ocr.repair_depth(14.32, 110.75) == 114.32
-    assert ocr.repair_depth(89.70, 86.00) == 89.70
-    assert ocr.repair_depth(None, 86.0) is None
-    assert ocr.repair_depth(5.0, 200.0) is None, "no plausible candidate -> blank"
+    # the depth sequence vetoes a bad reading; it must never invent one
+    assert ocr.veto_depth(89.70, 86.00) == 89.70
+    assert ocr.veto_depth(7.50, 67.05) is None, "backwards depth must be rejected"
+    assert ocr.veto_depth(200.0, 10.0) is None, "implausible jump must be rejected"
+    assert ocr.veto_depth(5.0, None) == 5.0, "no previous tray -> nothing to check"
+    assert ocr.veto_depth(None, 86.0) is None
+
+    # built-in digit reader ships with the app
+    from corephoto import glyphs
+    assert glyphs.available(), "glyph templates missing"
+    import numpy as np
+    blank = [np.full((40, 25), 255, np.uint8)] * 4
+    assert glyphs.read_digits(blank) is None, "blank glyphs must not be guessed at"
+    assert glyphs.read_digits([]) is None
+    assert ocr.reader_name() is not None
 
     pr = core.Params()
     assert abs(pr.scale - 5952 / ((744 + 12) * 8)) < 1e-9

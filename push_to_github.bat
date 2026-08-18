@@ -1,27 +1,37 @@
 @echo off
+setlocal
 REM ---------------------------------------------------------------
 REM  Core Photo Tool - push this folder to GitHub.
-REM  Edit REPO_URL below, save, then double-click this file.
+REM  Double-click. Edit REPO_URL below only if the repo moves.
 REM
-REM  Unlike dragging files into the browser, git DOES upload the
-REM  .github folder, which is what makes the automatic Windows build
-REM  work. Browsers silently skip dot-folders.
+REM  Unlike dragging files into a browser, git DOES upload the
+REM  .github folder - which is what makes the automatic Windows
+REM  build run. Browsers silently skip dot-folders.
 REM ---------------------------------------------------------------
 set REPO_URL=https://github.com/Almarant/core-photo-tool.git
 
 where git >nul 2>nul
 if errorlevel 1 (
-  echo Git is not installed. Get it from https://git-scm.com/download/win
-  echo Then run this file again.
-  pause
-  exit /b 1
+  echo Git is not installed.
+  echo Get it from https://git-scm.com/download/win  then run this again.
+  pause & exit /b 1
 )
 
 cd /d "%~dp0"
+
+REM Git refuses to commit without an identity. Set one just for this repo
+REM if the machine has none, so a first-time user is not stopped here.
 if not exist .git (
   git init
   git branch -M main
 )
+for /f "delims=" %%i in ('git config user.email 2^>nul') do set HAVE_EMAIL=%%i
+if "%HAVE_EMAIL%"=="" (
+  echo No git identity found - setting one for this repository only.
+  git config user.email "core-photo-tool@local"
+  git config user.name "Core Photo Tool"
+)
+
 git remote remove origin 2>nul
 git remote add origin %REPO_URL%
 
@@ -33,20 +43,30 @@ if not errorlevel 1 (
 )
 
 git add -A
-git commit -m "Core Photo Tool" || echo (nothing new to commit)
+git commit -m "Core Photo Tool: built-in label reader, drag-and-drop sources, manual crop corners"
+if errorlevel 1 echo (nothing new to commit - continuing)
+
 git push -u origin main
 if errorlevel 1 (
   echo.
-  echo Push failed. If it complains about diverged history, run:
-  echo    git push -u origin main --force
-  pause
-  exit /b 1
+  echo ---------------------------------------------------------------
+  echo Push failed.
+  echo  * Asked for a password? GitHub wants a Personal Access Token,
+  echo    not your account password. Easiest fix: install GitHub CLI
+  echo    or GitHub Desktop, sign in once, then run this again.
+  echo  * Complains about diverged history? Run:
+  echo        git push -u origin main --force
+  echo ---------------------------------------------------------------
+  pause & exit /b 1
 )
 
 git tag -f v1.0.0
 git push -f origin v1.0.0
 
 echo.
-echo Done. Open the Actions tab of your repo - the Windows build takes ~4 minutes,
-echo then the exe appears on the Releases page.
+echo ===============================================================
+echo Pushed.
+echo  Build progress : https://github.com/Almarant/core-photo-tool/actions
+echo  Download (~4m) : https://github.com/Almarant/core-photo-tool/releases
+echo ===============================================================
 pause

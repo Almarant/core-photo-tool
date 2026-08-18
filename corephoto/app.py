@@ -21,7 +21,19 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from . import core, naming, ocr
+from . import core, naming, ocr, settings
+
+# Drag-and-drop needs a different root window class, so decide before App is
+# defined. If the library is missing the app still works - you just use the
+# Add folder / Add files buttons.
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _Root = TkinterDnD.Tk
+    HAVE_DND = True
+except Exception:                                    # pragma: no cover
+    _Root = tk.Tk
+    DND_FILES = None
+    HAVE_DND = False
 
 APP_TITLE = "Core Photo Tool"
 UNCONFIRMED_BG = "#fff3cd"      # amber: filled by OCR, not yet checked by a human
@@ -58,7 +70,7 @@ class FolderState:
             r["confirmed"] = True     # nothing auto-filled yet
 
 
-class App(tk.Tk):
+class App(_Root):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
@@ -68,7 +80,7 @@ class App(tk.Tk):
         self._icon()
 
         self.params = core.Params()
-        self.indir = tk.StringVar()
+        self.sources = []                 # folders and/or individual image files
         self.outdir = tk.StringVar()
         self.normalise = tk.BooleanVar(value=True)
         self.use_ocr = tk.BooleanVar(value=ocr.available())
@@ -140,42 +152,157 @@ class App(tk.Tk):
     # ------------------------------------------------------------- tab 1
     def _build_t1(self):
         f = self.tab1
-        ttk.Label(f, text="Where are the photos?", style="Head.TLabel").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(16, 2))
-        ttk.Label(f, text="One subfolder per hole. Your originals are never modified.",
-                  style="Sub.TLabel").grid(row=1, column=0, columnspan=3, sticky="w",
-                                           padx=14, pady=(0, 16))
+        ttk.Label(f, text="Which photos?", style="Head.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(14, 2))
+        hint = ("Add whole folders, or just the few photos you want. "
+                "One folder per hole. Your originals are never modified.")
+        if HAVE_DND:
+            hint = "Drag photos or folders straight onto the list below. " + hint
+        ttk.Label(f, text=hint, style="Sub.TLabel", wraplength=1120,
+                  justify="left").grid(row=1, column=0, columnspan=3, sticky="w",
+                                       padx=14, pady=(0, 10))
 
-        ttk.Label(f, text="Photo folder").grid(row=2, column=0, sticky="e", padx=(14, 10), pady=7)
-        ttk.Entry(f, textvariable=self.indir).grid(row=2, column=1, sticky="we", pady=7)
-        ttk.Button(f, text="Browse", command=self._pick_in).grid(row=2, column=2, padx=10)
+        listwrap = ttk.Frame(f)
+        listwrap.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=(14, 8))
+        self.srclist = tk.Listbox(listwrap, height=7, activestyle="none",
+                                  selectmode="extended", bd=1, relief="solid",
+                                  highlightthickness=0, font=("Segoe UI", 9))
+        sb = ttk.Scrollbar(listwrap, orient="vertical", command=self.srclist.yview)
+        self.srclist.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y"); self.srclist.pack(side="left", fill="both", expand=True)
+        if HAVE_DND:
+            for w in (self.srclist, f):
+                try:
+                    w.drop_target_register(DND_FILES)
+                    w.dnd_bind("<<Drop>>", self._on_drop)
+                except Exception:
+                    pass
 
-        ttk.Label(f, text="Save results to").grid(row=3, column=0, sticky="e", padx=(14, 10), pady=7)
-        ttk.Entry(f, textvariable=self.outdir).grid(row=3, column=1, sticky="we", pady=7)
-        ttk.Button(f, text="Browse", command=self._pick_out).grid(row=3, column=2, padx=10)
+        btns = ttk.Frame(f); btns.grid(row=2, column=2, sticky="n", padx=(0, 14))
+        ttk.Button(btns, text="Add folder…", command=self._add_folder).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Add files…", command=self._add_files).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Remove", command=self._remove_sel).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Clear", command=self._clear_sources).pack(fill="x", pady=2)
 
-        opts = ttk.Frame(f); opts.grid(row=4, column=1, sticky="w", pady=(18, 6))
+        out = ttk.Frame(f); out.grid(row=3, column=0, columnspan=3, sticky="we",
+                                     padx=14, pady=(12, 4))
+        ttk.Label(out, text="Save results to").pack(side="left")
+        ttk.Entry(out, textvariable=self.outdir).pack(side="left", fill="x",
+                                                      expand=True, padx=10)
+        ttk.Button(out, text="Browse", command=self._pick_out).pack(side="left")
+
+        opts = ttk.Frame(f); opts.grid(row=4, column=0, columnspan=3, sticky="w",
+                                       padx=14, pady=(12, 4))
         ttk.Checkbutton(opts, text="Correct exposure and white balance "
                                    "(referenced to the tape measure)",
-                        variable=self.normalise).pack(anchor="w", pady=3)
-        cb = ttk.Checkbutton(opts, text="Pre-fill depths with OCR  —  a hint only, "
-                                        "shown in amber until you check it",
-                             variable=self.use_ocr)
-        cb.pack(anchor="w", pady=3)
-        if not ocr.available():
-            cb.state(["disabled"])
-            ttk.Label(opts, text="Tesseract OCR not found, so depths start blank. "
-                                 "Install it and restart to enable pre-fill.",
-                      style="Hint.TLabel").pack(anchor="w", pady=(2, 0))
+                        variable=self.normalise).pack(anchor="w", pady=2)
+        self.ocr_cb = ttk.Checkbutton(
+            opts, text="Pre-fill depths by reading the label bar  —  a hint only, "
+                       "shown in amber until you check it",
+            variable=self.use_ocr)
+        self.ocr_cb.pack(anchor="w", pady=2)
+        ocrrow = ttk.Frame(opts); ocrrow.pack(anchor="w", pady=(2, 0))
+        self.ocr_lbl = ttk.Label(ocrrow, text="", style="Hint.TLabel")
+        self.ocr_lbl.pack(side="left")
+        ttk.Button(ocrrow, text="Locate Tesseract (optional)…",
+                   command=self._locate_tesseract).pack(side="left", padx=8)
+        ttk.Button(ocrrow, text="Re-check", command=self._refresh_ocr).pack(side="left")
+        self._refresh_ocr()
 
         self.scan_btn = ttk.Button(f, text="Scan photos", style="Go.TButton", command=self.scan)
-        self.scan_btn.grid(row=5, column=1, sticky="w", pady=(20, 10))
+        self.scan_btn.grid(row=5, column=0, sticky="w", padx=14, pady=(14, 8))
 
-        self.log = tk.Text(f, height=14, relief="flat", bg="#fbfbfb", bd=1,
+        self.log = tk.Text(f, height=9, relief="flat", bg="#fbfbfb", bd=1,
                            highlightthickness=1, highlightbackground="#dcdcdc",
                            font=("Consolas", 9), padx=10, pady=8)
-        self.log.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=14, pady=(8, 12))
+        self.log.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=14, pady=(4, 12))
         f.columnconfigure(1, weight=1); f.rowconfigure(6, weight=1)
+
+    # ----------------------------------------------------------- sources
+    def _add_sources(self, paths):
+        added = 0
+        for p in paths:
+            p = os.path.abspath(p.strip())
+            if not p or not os.path.exists(p):
+                continue
+            if os.path.isfile(p) and not p.lower().endswith(core.IMAGE_EXT):
+                continue
+            if any(os.path.normcase(p) == os.path.normcase(q) for q in self.sources):
+                continue
+            self.sources.append(p)
+            added += 1
+        self._refresh_sources()
+        if added and not self.outdir.get():
+            first = self.sources[0]
+            base = first if os.path.isdir(first) else os.path.dirname(first)
+            self.outdir.set(os.path.join(base, "processed"))
+        return added
+
+    def _refresh_sources(self):
+        self.srclist.delete(0, "end")
+        for p in self.sources:
+            tag = "[folder]" if os.path.isdir(p) else "[file]  "
+            self.srclist.insert("end", f"{tag}  {p}")
+
+    def _on_drop(self, event):
+        # tk returns a brace-quoted list when paths contain spaces
+        paths = self.tk.splitlist(event.data)
+        n = self._add_sources(paths)
+        self.status.configure(text=f"added {n} item(s)")
+
+    def _add_folder(self):
+        d = filedialog.askdirectory(title="Folder with core photos")
+        if d:
+            self._add_sources([d])
+
+    def _add_files(self):
+        fs = filedialog.askopenfilenames(
+            title="Choose photos",
+            filetypes=[("JPEG images", "*.jpg *.jpeg *.JPG *.JPEG"), ("All files", "*.*")])
+        if fs:
+            self._add_sources(list(fs))
+
+    def _remove_sel(self):
+        for i in sorted(self.srclist.curselection(), reverse=True):
+            del self.sources[i]
+        self._refresh_sources()
+
+    def _clear_sources(self):
+        self.sources = []
+        self._refresh_sources()
+
+    # ------------------------------------------------------------ tesseract
+    def _refresh_ocr(self):
+        """The built-in reader always works; Tesseract is only a fallback."""
+        if glyphs_available := ocr.reader_name():
+            self.ocr_cb.state(["!disabled"])
+            extra = ""
+            if not ocr.tesseract_available():
+                extra = "   (Tesseract not installed — not needed)"
+            self.ocr_lbl.configure(text=f"Reader: {glyphs_available}{extra}")
+        else:
+            self.use_ocr.set(False)
+            self.ocr_cb.state(["disabled"])
+            self.ocr_lbl.configure(text="No reader available — depths start blank.")
+
+    def _locate_tesseract(self):
+        p = filedialog.askopenfilename(
+            title="Find tesseract.exe",
+            initialdir=r"C:\Program Files\Tesseract-OCR" if os.name == "nt" else "/usr/bin",
+            filetypes=[("tesseract", "tesseract.exe tesseract"), ("All files", "*.*")])
+        if not p:
+            return
+        if ocr.set_manual_path(p):
+            self.use_ocr.set(True)
+            self._refresh_ocr()
+            messagebox.showinfo(APP_TITLE, "Tesseract found and remembered.\n\n"
+                                           "It is only a fallback — the built-in "
+                                           "reader is used first.")
+        else:
+            messagebox.showwarning(
+                APP_TITLE,
+                "That file did not run as Tesseract.\n\nLooked for it in:\n  • "
+                + "\n  • ".join(ocr.search_paths()))
 
     # ------------------------------------------------------------- tab 2
     def _build_t2(self):
@@ -288,15 +415,14 @@ class App(tk.Tk):
         self.t3msg.pack(side="left", padx=14)
 
     # ------------------------------------------------------------ plumbing
+    @staticmethod
+    def _label(path):
+        """Short, unambiguous name: parent folder + filename."""
+        return os.path.join(os.path.basename(os.path.dirname(path)),
+                            os.path.basename(path)).replace(os.sep, "/")
+
     def say(self, m):
         self.log.insert("end", m + "\n"); self.log.see("end")
-
-    def _pick_in(self):
-        d = filedialog.askdirectory(title="Folder with core photos")
-        if d:
-            self.indir.set(d)
-            if not self.outdir.get():
-                self.outdir.set(os.path.join(d, "processed"))
 
     def _pick_out(self):
         d = filedialog.askdirectory(title="Where to save results")
@@ -339,18 +465,21 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------------- scan
     def scan(self):
-        indir = self.indir.get().strip()
-        if not indir or not os.path.isdir(indir):
-            messagebox.showwarning(APP_TITLE, "Choose the folder with your core photos first.")
+        if not self.sources:
+            messagebox.showwarning(APP_TITLE, "Add a folder or some photos first.")
             return
-        outdir = self.outdir.get().strip() or os.path.join(indir, "processed")
+        first = self.sources[0]
+        base = first if os.path.isdir(first) else os.path.dirname(first)
+        outdir = self.outdir.get().strip() or os.path.join(base, "processed")
         self.outdir.set(outdir)
         self.params.normalise = self.normalise.get()
         self.log.delete("1.0", "end")
-        self._bg(lambda: self._scan_work(indir, outdir))
+        self._bg(lambda: self._scan_work(list(self.sources), outdir))
 
-    def _scan_work(self, indir, outdir):
-        photos = core.find_photos(indir, skip_dirs=(outdir,))
+    def _scan_work(self, sources, outdir):
+        photos = core.find_photos(sources, skip_dirs=(outdir,))
+        do_ocr = self.use_ocr.get() and ocr.available()
+        raw_depth = {}
         if not photos:
             self._q.put(lambda: messagebox.showwarning(APP_TITLE, "No JPEG photos found."))
             return
@@ -364,6 +493,11 @@ class App(tk.Tk):
             det[p] = d
             crop, _ = core.render(p, d, self.params)
             coreL[p] = core.core_stats(crop)[0]
+            # Read the bar now, while the FULL-RESOLUTION crop is in hand. The
+            # display strip below is a quarter-size copy and far too small to
+            # read reliably.
+            if do_ocr:
+                raw_depth[p] = ocr.read_depth(core.label_strip(crop))
             w = 1500
             d["strip"] = core.label_strip(
                 cv2.resize(crop, (w, max(int(w * crop.shape[0] / crop.shape[1]), 1)),
@@ -373,11 +507,21 @@ class App(tk.Tk):
 
         by = {}
         for p in self.photos:
-            by.setdefault(os.path.relpath(os.path.dirname(p), indir), []).append(p)
-        self.folders = {rel: FolderState(rel, ps) for rel, ps in by.items()}
+            by.setdefault(os.path.dirname(p), []).append(p)
+        self.folders = {}
+        for d, ps in by.items():
+            name = os.path.basename(d) or d
+            while name in self.folders:            # two folders, same basename
+                name += "_"
+            fs = FolderState(d, ps)
+            # Seed the hole from the folder name. An empty Hole field produced
+            # files called "_Dry_Tray1_...", which is the sort of thing you only
+            # notice after processing a whole hole.
+            fs.hole.set(name)
+            self.folders[name] = fs
 
-        if self.use_ocr.get() and ocr.available():
-            self._ocr_fill(len(self.photos))
+        if do_ocr:
+            self._apply_ocr(raw_depth)
 
         def finish():
             for p in failed:
@@ -388,10 +532,10 @@ class App(tk.Tk):
             if cut:
                 self.say(f"  {cut} photo(s) have the tray running past the frame edge; "
                          f"those ends are padded grey and flagged in the manifest.")
-            for rel, fs in self.folders.items():
-                self.say(f"  {rel or '.'}: {len(fs.photos)} photos "
+            for name, fs in self.folders.items():
+                self.say(f"  {name}: {len(fs.photos)} photos "
                          f"({len(fs.photos)//2} trays expected)")
-            self.pick["values"] = [os.path.relpath(p, self.indir.get()) for p in self.photos]
+            self.pick["values"] = [self._label(p) for p in self.photos]
             if self.photos:
                 self.pick.current(0)
             self.folder_pick["values"] = list(self.folders.keys())
@@ -403,27 +547,52 @@ class App(tk.Tk):
             self.status.configure(text="Scan complete")
         self._q.put(finish)
 
-    def _ocr_fill(self, total):
-        """Pre-fill depths. Values are marked unconfirmed (amber) and repaired
-        against the depth sequence where the sequence makes the fix unambiguous."""
-        done = 0
+    def _apply_ocr(self, raw_depth):
+        """Put the readings into the table.
+
+        Grouped BY TRAY, not by photo. Both shots of a tray carry the same
+        number, so a per-photo depth check rejects the second one every time
+        (the gap to the previous reading is zero). Grouping also means one good
+        read covers its partner, which measurably lifts the fill rate.
+
+        Everything lands amber - unconfirmed - until a human passes over it.
+        """
+        filled = 0
         for fs in self.folders.values():
-            prev = None
+            trays = {}
             for r in fs.rows:
-                done += 1
-                self._set_progress(done, total, f"Reading labels {done} of {total}")
-                strip = self.det[r["src"]].get("strip")
-                v = ocr.read_depth(strip)
-                if prev is not None:
-                    v = ocr.repair_depth(v, prev)
-                if v is not None:
+                try:
+                    t = int(r["tray"].get())
+                except ValueError:
+                    continue
+                trays.setdefault(t, []).append(r)
+            prev = None
+            for t in sorted(trays):
+                rows = trays[t]
+                seen = [raw_depth.get(r["src"]) for r in rows]
+                seen = [v for v in seen if v is not None]
+                if not seen or len(set(seen)) > 1:
+                    continue          # nothing read, or the two shots disagree
+                v = ocr.veto_depth(seen[0], prev)
+                if v is None:
+                    continue          # cannot be right given the previous tray
+                prev = v
+                for r in rows:
                     r["depth"].set(f"{v:.2f}")
                     r["confirmed"] = False
-                    prev = v
+                    filled += 1
             h, _ = ocr.read_hole_and_tray(self.det[fs.photos[0]].get("strip")) \
                 if fs.photos else (None, None)
-            if h and not fs.hole.get():
+            if h and not fs.hole.get().startswith("DD26ZOP-"):
                 fs.hole.set(f"DD26ZOP-{h}")
+        total = sum(len(fs.rows) for fs in self.folders.values())
+        self._q.put(lambda: self.say(
+            f"  filled {filled} of {total} depth boxes from the label bars "
+            f"(amber = unchecked, please look them over)"))
+
+    # ------------------------------------------------------------- preview
+
+    # ------------------------------------------------------------- preview
 
     # ------------------------------------------------------------- preview
     def _step(self, k):
@@ -660,7 +829,7 @@ class App(tk.Tk):
         for rel, fs in self.folders.items():
             hole, groups, ends, first, _, probs = self._collect(fs)
             probs += naming.validate(hole, groups, ends, first)
-            allp += [f"[{rel or '.'}] {p}" for p in probs]
+            allp += [f"[{rel}] {p}" for p in probs]
         if not silent:
             if allp:
                 messagebox.showwarning(APP_TITLE, "Please check:\n\n• " +
@@ -720,7 +889,7 @@ class App(tk.Tk):
                     cv2.imwrite(dst, crop, [cv2.IMWRITE_JPEG_QUALITY, self.params.jpeg_quality])
                     d = self.det[s]
                     manifest.append(dict(
-                        source=os.path.relpath(s, self.indir.get()),
+                        source=self._label(s),
                         final=os.path.relpath(dst, outdir), hole=hole, tray=tray,
                         from_m=f"{start:.2f}", to_m=f"{end:.2f}",
                         interval_m=round(end - start, 2), condition=conds[s],

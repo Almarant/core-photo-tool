@@ -1,17 +1,22 @@
 """
-Label-bar OCR. Pre-fill only, never trusted.
+Label-bar reading. Pre-fill only - never trusted, never auto-accepted.
 
-Measured on 72 real DD26ZOP labels (Tesseract 5.3):
+Two readers, tried in order:
 
-  whole bar, default settings ....... hole 36%, tray 59%, end depth 67%
-  depth region + digit whitelist .... 38% exact
-  ... plus sequence-based repair .... 57% correct, 38% blank, 6% SILENTLY WRONG
+1. `glyphs` - the built-in digit classifier. Trained on the project's own
+   stencil tiles, needs no installation, ships inside the app.
+2. Tesseract - only if it happens to be installed. A general OCR engine, and on
+   this material a poor one.
 
-That last 6% is the reason nothing here is auto-accepted. The common failure is
-a dropped leading digit (110.75 read as 10.75), which breaks the depth sequence
-and so can be caught and often repaired. What survives repair is the nasty kind:
-22.90 read as 22.3, still increasing, still a plausible interval, undetectable.
-So the app shows every OCR value as unconfirmed until a human passes over it.
+Measured over the same 72 real DD26ZOP labels:
+
+    Tesseract, best configuration ... 38% correct, 6% CONFIDENTLY WRONG
+    built-in classifier ............. 93% correct,  7% blank, 0% wrong
+
+The depth sequence is used to **veto** a reading, never to invent one. An
+earlier version tried to repair a dropped digit from the sequence; on the single
+bad read in the set it turned an obviously-wrong 7.5 into a plausible-looking
+67.5, which is far harder for a human to spot. Rejecting is the safer failure.
 """
 import os
 import re
@@ -19,14 +24,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
 import cv2
 import numpy as np
+
+from . import glyphs
 
 DIGITS = "0123456789."
 
 
+# --------------------------------------------------------- Tesseract (opt.)
 def _bundled_tesseract():
-    """PyInstaller unpacks bundled binaries next to the app; prefer that copy."""
     base = getattr(sys, "_MEIPASS", None)
     if base:
         for name in ("tesseract.exe", "tesseract"):
@@ -36,15 +44,101 @@ def _bundled_tesseract():
     return None
 
 
+# The Windows installer often does not put Tesseract on PATH, so shutil.which()
+# misses it even where it is installed.
+_WIN_CANDIDATES = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR",
+                 "tesseract.exe"),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Tesseract-OCR", "tesseract.exe"),
+    os.path.join(os.environ.get("PROGRAMFILES", ""), "Tesseract-OCR", "tesseract.exe"),
+)
+
+
+def _registry_tesseract():
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for key in (r"SOFTWARE\Tesseract-OCR", r"SOFTWARE\WOW6432Node\Tesseract-OCR"):
+            for value in ("InstallDir", "Path", ""):
+                try:
+                    with winreg.OpenKey(root, key) as k:
+                        d = winreg.QueryValueEx(k, value)[0]
+                    p = os.path.join(d, "tesseract.exe")
+                    if os.path.exists(p):
+                        return p
+                except OSError:
+                    continue
+    return None
+
+
+def search_paths():
+    out = ["the copy bundled in the app", "PATH"]
+    if os.name == "nt":
+        out += [p for p in _WIN_CANDIDATES if p]
+        out.append("the Windows registry (SOFTWARE\\Tesseract-OCR)")
+    return out
+
+
 def tesseract_path():
-    return _bundled_tesseract() or shutil.which("tesseract")
+    p = _bundled_tesseract()
+    if p:
+        return p
+    try:
+        from . import settings
+        saved = settings.get("tesseract_path")
+    except Exception:
+        saved = None
+    if saved and os.path.exists(saved):
+        return saved
+    p = shutil.which("tesseract")
+    if p:
+        return p
+    if os.name == "nt":
+        for c in _WIN_CANDIDATES:
+            if c and os.path.exists(c):
+                return c
+        return _registry_tesseract()
+    return None
 
 
-def available():
+def tesseract_available():
     return tesseract_path() is not None
 
 
-def _run(img, psm, whitelist):
+def set_manual_path(path):
+    from . import settings
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=20,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        ok = r.returncode == 0 or "tesseract" in (r.stdout + r.stderr).lower()
+    except Exception:
+        return False
+    if ok:
+        settings.put("tesseract_path", path)
+    return ok
+
+
+def tesseract_version():
+    p = tesseract_path()
+    if not p:
+        return None
+    try:
+        r = subprocess.run([p, "--version"], capture_output=True, text=True, timeout=20,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return (r.stdout or r.stderr).splitlines()[0].strip()
+    except Exception:
+        return None
+
+
+def _tess_run(img, psm, whitelist):
     exe = tesseract_path()
     if not exe:
         return ""
@@ -70,94 +164,69 @@ def _run(img, psm, whitelist):
             pass
 
 
-def _tiles(g):
-    """Mask of the white letter tiles."""
-    bl = cv2.GaussianBlur(g, (0, 0), 3)
-    m = (bl > max(140, np.percentile(bl, 90) * 0.72)).astype(np.uint8) * 255
-    return cv2.morphologyEx(m, cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)))
-
-
-def depth_crop(bar):
-    """The rightmost group of white tiles = the END DEPTH number.
-
-    Padded generously on the left: a tight crop clips the leading digit, which
-    was the single biggest source of wrong readings in testing.
-    """
-    if bar is None or bar.size == 0:
-        return None
-    g = cv2.cvtColor(bar, cv2.COLOR_BGR2GRAY) if bar.ndim == 3 else bar
-    m = _tiles(g)
-    n, lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
-    groups = [(st[i, 0], st[i, 1], st[i, 2], st[i, 3]) for i in range(1, n)
-              if st[i, 4] > 6000 and st[i, 3] > 35 and st[i, 2] > 60]
-    if not groups:
-        return None
-    x, y, w, h = max(groups, key=lambda b: b[0])
-    padx, pady = int(0.60 * h), int(0.30 * h)      # generous left/right pad
-    sub = g[max(y - pady, 0):min(y + h + pady, g.shape[0]),
-            max(x - padx, 0):min(x + w + padx, g.shape[1])]
-    if sub.size == 0:
-        return None
-    sub = cv2.resize(sub, (sub.shape[1] * 3, sub.shape[0] * 3), interpolation=cv2.INTER_CUBIC)
-    sub = cv2.threshold(sub, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    return cv2.copyMakeBorder(sub, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
-
-
-def _to_depth(text):
-    s = "".join(re.findall(r"\d", text))
-    if len(s) < 3:
-        return None
-    s = s[:5]
-    try:
-        return float(s[:-2] + "." + s[-2:])
-    except ValueError:
-        return None
-
-
-def read_depth(bar):
-    """Best-effort end depth from the label bar, or None."""
-    if not available():
-        return None
-    crop = depth_crop(bar)
+def _tess_depth(bar):
+    crop = glyphs.depth_region(bar)
     if crop is None:
         return None
+    crop = cv2.resize(crop, (crop.shape[1] * 3, crop.shape[0] * 3),
+                      interpolation=cv2.INTER_CUBIC)
+    crop = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    crop = cv2.copyMakeBorder(crop, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
     for psm in (8, 7, 13, 6):
-        d = _to_depth(_run(crop, psm, DIGITS))
-        if d is not None:
-            return d
+        s = "".join(re.findall(r"\d", _tess_run(crop, psm, DIGITS)))
+        if len(s) >= 3:
+            s = s[:5]
+            try:
+                return float(s[:-2] + "." + s[-2:])
+            except ValueError:
+                pass
     return None
 
 
-def repair_depth(value, prev_end, min_interval=0.3, max_interval=8.0):
-    """Use the depth sequence to fix a dropped leading digit.
+# ------------------------------------------------------------------ public
+def available():
+    return glyphs.available() or tesseract_available()
 
-    Returns the repaired value only when exactly one candidate fits between
-    prev_end + min_interval and prev_end + max_interval; otherwise None, so the
-    field is left blank rather than filled with a guess.
+
+def reader_name():
+    if glyphs.available():
+        return "built-in digit reader"
+    if tesseract_available():
+        return "Tesseract (fallback)"
+    return None
+
+
+def read_depth(bar):
+    """End depth from a label bar, or None. Built-in reader first."""
+    v = glyphs.read_depth(bar) if glyphs.available() else None
+    if v is None and tesseract_available():
+        v = _tess_depth(bar)
+    return v
+
+
+def veto_depth(value, prev_end, min_interval=0.3, max_interval=8.0):
+    """Drop a reading that cannot be right given the previous tray's end depth.
+
+    Only ever rejects. Inventing a correction produces plausible-looking wrong
+    numbers, which is worse than an empty box.
     """
     if value is None or prev_end is None:
         return value
-    cands = [value]
-    ip, dp = f"{value:.2f}".split(".")
-    for d in "123456789":
-        cands.append(float(d + ip + "." + dp))
-    ok = [c for c in cands if min_interval <= c - prev_end <= max_interval]
-    return ok[0] if len(ok) == 1 else None
+    return value if min_interval <= value - prev_end <= max_interval else None
 
 
 def read_hole_and_tray(bar):
-    """Hole suffix and tray number from the whole bar. Weaker than the depth
-    read (36% / 59% in testing) - a hint for the first row only."""
-    if not available() or bar is None:
+    """Hole suffix and tray number, Tesseract only - weak, a hint for the
+    first row. The built-in reader covers digits, not letters."""
+    if not tesseract_available() or bar is None:
         return (None, None)
     g = cv2.cvtColor(bar, cv2.COLOR_BGR2GRAY) if bar.ndim == 3 else bar
-    tile = _tiles(g)
+    tile = glyphs._tiles_mask(g)
     out = np.full_like(g, 255)
     out[tile > 0] = g[tile > 0]
     img = cv2.threshold(out, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     t = re.sub(r"\s+", " ", re.sub(r"[|\n]+", " ",
-               _run(img, 6, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-· ").upper()))
+               _tess_run(img, 6, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-· ").upper()))
     hole = re.search(r"DD\s*\d{2}\s*Z\s*[O0]\s*P\s*[-\s]*(\d{2,3})", t)
     tray = re.search(r"T\s*R\s*A\s*Y\s*(\d{1,2})", t)
     return (hole.group(1) if hole else None,

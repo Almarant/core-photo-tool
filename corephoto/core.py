@@ -237,16 +237,37 @@ def render(path, d, p: Params, adj=None):
     return crop, gains
 
 
-def find_photos(indir, skip_dirs=()):
-    """All JPEGs under indir, skipping output folders and _/. folders."""
+IMAGE_EXT = (".jpg", ".jpeg")
+
+
+def find_photos(sources, skip_dirs=()):
+    """Expand a mix of folders and individual files into a photo list.
+
+    Accepts a single path or a list, so the app can offer "pick a folder",
+    "pick some files" and drag-and-drop through one code path.
+    """
+    if isinstance(sources, str):
+        sources = [sources]
     skip = {os.path.basename(s).lower() for s in skip_dirs if s}
     out = []
-    for root, dirs, names in os.walk(indir):
-        dirs[:] = [d for d in dirs if not d.startswith(("_", ".")) and d.lower() not in skip]
-        for n in sorted(names):
-            if n.lower().endswith((".jpg", ".jpeg")):
-                out.append(os.path.join(root, n))
-    return sorted(out)
+    for src in sources:
+        if os.path.isfile(src):
+            if src.lower().endswith(IMAGE_EXT):
+                out.append(src)
+            continue
+        for root, dirs, names in os.walk(src):
+            dirs[:] = [d for d in dirs
+                       if not d.startswith(("_", ".")) and d.lower() not in skip]
+            for n in sorted(names):
+                if n.lower().endswith(IMAGE_EXT):
+                    out.append(os.path.join(root, n))
+    seen, uniq = set(), []
+    for p in sorted(out):
+        k = os.path.normcase(os.path.abspath(p))
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return uniq
 
 
 def label_strip(crop, frac=0.16):
