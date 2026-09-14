@@ -22,8 +22,7 @@ Output: `DD26ZOP-006_Dry_Tray22_82.50-86.00m.jpg`
 
 ## For geologists — just use it
 
-1. Download **CorePhotoTool.exe** from the
-   [Releases page](../../releases) and double-click it. Nothing to install.
+1. Download the .exe using the button above and double-click it.
 2. **Step 1 – Photos.** Add what you want to process: **drag folders or
    individual photos onto the list**, or use **Add folder…** / **Add files…**.
    Mix both freely — a whole hole plus one stray reshoot is fine, and processing
