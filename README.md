@@ -1,5 +1,15 @@
 # Core Photo Tool
 
+[![Download](https://img.shields.io/badge/Download-CorePhotoTool.exe-2ea44f?style=for-the-badge&logo=windows)](https://github.com/Almarant/core-photo-tool/releases/latest/download/CorePhotoTool.exe)
+[![Release](https://img.shields.io/github/v/release/Almarant/core-photo-tool?style=flat-square)](https://github.com/Almarant/core-photo-tool/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Almarant/core-photo-tool/total?style=flat-square)](https://github.com/Almarant/core-photo-tool/releases)
+
+### ⬇️ [Download CorePhotoTool.exe](https://github.com/Almarant/core-photo-tool/releases/latest/download/CorePhotoTool.exe) — Windows, 71 MB, nothing to install
+
+> Windows will warn you it's from an unknown publisher (the app isn't code-signed).
+> Click **More info → Run anyway**. First launch takes 5–15 seconds while it unpacks —
+> it looks frozen, it isn't.
+
 Crops, straightens, colour-corrects, sorts dry/wet and renames drill-core tray
 photographs. Point it at a folder, check one preview, type the tray depths, press
 go.
