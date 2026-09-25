@@ -27,6 +27,13 @@ built-in label reader is trained on that project's stencil kit. Everything else
 is generic - if your trays and labels look different, see
 [If your photos are different](#if-your-photos-are-different).
 
+![Step 2 of the app: the detected crop drawn on a photo, with the finished crop beside it](docs/crop-check.jpg)
+
+*Step 2. The red box is what the tool found by itself; the yellow handles are
+there for the photos it gets wrong. The finished crop is on the right, and the
+line underneath reports the tilt it corrected, how the tray was found, the
+output size and the colour gains it applied.*
+
 ---
 
 ## Using it
