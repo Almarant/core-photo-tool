@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from . import core, naming, ocr, settings
+from . import __version__, core, logfile, naming, ocr
 
 # Drag-and-drop needs a different root window class, so decide before App is
 # defined. If the library is missing the app still works - you just use the
@@ -35,7 +35,20 @@ except Exception:                                    # pragma: no cover
     DND_FILES = None
     HAVE_DND = False
 
-APP_TITLE = "Core Photo Tool"
+APP_TITLE = f"Core Photo Tool {__version__}"
+
+# Scanning only needs the crop for dry/wet luminance, the label reading and a
+# thumbnail. Doing that at half size is four times less pixel work per photo;
+# the old code rendered every photo at the full 5952 px during the scan and
+# then the run rendered them all again. Saving is always full resolution.
+SCAN_REDUCE = 2
+
+# Above this L* gap between a tray's two shots, the dry/wet call is taken as
+# settled; below it the pair is listed for a human to look at. 12 was read off
+# the DD26ZOP set, where the core is pale and the wet/dry contrast is large. On
+# the darker UG26ZOP core, pairs that are obvious to the eye separate by 4-6,
+# so 12 flags most of the batch and the list stops meaning anything.
+DRY_WET_MARGIN = 6.0
 UNCONFIRMED_BG = "#fff3cd"      # amber: filled by OCR, not yet checked by a human
 CONFIRMED_BG = "#ffffff"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,9 +78,8 @@ class FolderState:
                           tray=tk.StringVar(value=str(guess[s])),
                           depth=tk.StringVar(),
                           cond=tk.StringVar(value="Auto"),
-                          confirmed=(True, )) for s in self.photos]
-        for r in self.rows:
-            r["confirmed"] = True     # nothing auto-filled yet
+                          confirmed=True,          # nothing auto-filled yet
+                          tray_confirmed=True) for s in self.photos]
 
 
 class App(_Root):
@@ -87,16 +99,25 @@ class App(_Root):
         self.show_raw = tk.BooleanVar(value=False)
 
         self.photos, self.det, self.core_L, self.folders = [], {}, {}, {}
+        self.recovered = set()   # photos the tray finder could not read
         self.adj = {}            # path -> [[dx,dy] x4] manual corner nudges
+        self.profiles = {}       # folder -> calibrated box, see _apply_box_all
         self._drag = None
         self._pv = None          # canvas<->image mapping for the preview
         self.preview_idx = 0
         self._q = queue.Queue()
         self._busy = False
+        # True only while the detection results are being replaced. Separate
+        # from _busy on purpose: _scan_done runs on the main thread BEFORE the
+        # callback that clears _busy, so a preview drawn from inside it was
+        # thrown away by the _busy guard and the first photo came up blank
+        # until you stepped to the next one and back.
+        self._det_lock = False
         self._thumbs = []
 
         self._build()
-        self.after(80, self._drain)
+        self._drain_id = self.after(80, self._drain)
+        logfile.session_header(__version__)
 
     # ------------------------------------------------------------ chrome
     def _theme(self):
@@ -352,8 +373,8 @@ class App(_Root):
         ctl2 = ttk.Frame(f); ctl2.pack(fill="x", padx=14, pady=(0, 4))
         ttk.Button(ctl2, text="Undo my corner changes on this photo",
                    command=self._reset_adj).pack(side="left")
-        ttk.Button(ctl2, text="Copy this adjustment to every photo in the folder",
-                   command=self._apply_adj_all).pack(side="left", padx=10)
+        ttk.Button(ctl2, text="Use this box for every photo in this folder",
+                   command=self._apply_box_all).pack(side="left", padx=10)
         self.adj_lbl = ttk.Label(ctl2, text="", style="Hint.TLabel")
         self.adj_lbl.pack(side="left", padx=12)
         self.info = ttk.Label(f, text="", style="Hint.TLabel")
@@ -402,9 +423,9 @@ class App(_Root):
         self.canvas.create_window((0, 0), window=self.rowsf, anchor="nw")
         self.rowsf.bind("<Configure>",
                         lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        for seq, d in (("<MouseWheel>", None), ("<Button-4>", -1), ("<Button-5>", 1)):
-            self.canvas.bind_all(seq, lambda e, d=d: self.canvas.yview_scroll(
-                d if d is not None else int(-e.delta / 120), "units"))
+        # bind, not bind_all: bind_all sent the wheel to this table from
+        # anywhere in the app, so scrolling the log on step 1 scrolled step 3.
+        self._bind_wheel(self.canvas)
 
         bot = ttk.Frame(f); bot.pack(fill="x", padx=14, pady=(0, 12))
         ttk.Button(bot, text="Check", command=self.validate).pack(side="left")
@@ -415,6 +436,39 @@ class App(_Root):
         self.t3msg.pack(side="left", padx=14)
 
     # ------------------------------------------------------------ plumbing
+    def _wheel(self, e=None, d=None):
+        if d is None:
+            d = int(-getattr(e, "delta", 0) / 120) or 0
+        try:
+            if d:
+                self.canvas.yview_scroll(d, "units")
+        except tk.TclError:
+            pass
+        return "break"      # stops ttk's own wheel binding on the combobox
+
+    def _bind_wheel(self, w):
+        """Wheel scrolling from any widget inside the QC table.
+
+        Binding only the canvas and its frame did nothing once the rows were
+        built: the rows cover the canvas completely, so the pointer is always
+        over a child widget and the wheel event never reached anything that
+        knew how to scroll. Every descendant needs the binding.
+
+        The Dry/Wet combobox makes this more than a convenience. ttk binds the
+        wheel on a combobox to CHANGE ITS VALUE, so a scroll that landed on
+        that column silently edited the data instead of moving the list.
+        Returning "break" from a per-widget binding stops the class binding
+        from running, which kills that off as well.
+        """
+        try:
+            w.bind("<MouseWheel>", self._wheel)
+            w.bind("<Button-4>", lambda e: self._wheel(e, -1))
+            w.bind("<Button-5>", lambda e: self._wheel(e, 1))
+        except tk.TclError:
+            return
+        for c in w.winfo_children():
+            self._bind_wheel(c)
+
     @staticmethod
     def _label(path):
         """Short, unambiguous name: parent folder + filename."""
@@ -435,7 +489,18 @@ class App(_Root):
                 self._q.get_nowait()()
         except queue.Empty:
             pass
-        self.after(80, self._drain)
+        self._drain_id = self.after(80, self._drain)
+
+    def destroy(self):
+        # Without this, closing the window leaves the 80 ms drain timer armed
+        # and Tk prints `invalid command name ..._drain` on the way out.
+        try:
+            if getattr(self, "_drain_id", None):
+                self.after_cancel(self._drain_id)
+                self._drain_id = None
+        except Exception:
+            pass
+        super().destroy()
 
     def _bg(self, work):
         if self._busy:
@@ -452,6 +517,7 @@ class App(_Root):
             finally:
                 def done():
                     self._busy = False
+                    self._det_lock = False
                     self.scan_btn.state(["!disabled"]); self.run_btn.state(["!disabled"])
                 self._q.put(done)
         threading.Thread(target=wrapper, daemon=True).start()
@@ -474,36 +540,117 @@ class App(_Root):
         self.outdir.set(outdir)
         self.params.normalise = self.normalise.get()
         self.log.delete("1.0", "end")
+        self._det_lock = True
         self._bg(lambda: self._scan_work(list(self.sources), outdir))
 
     def _scan_work(self, sources, outdir):
+        """Worker thread. Produces PLAIN DATA only.
+
+        Nothing here may create or set a tkinter variable. The previous version
+        built FolderState - and therefore StringVars - on this thread, and then
+        wrote to them from here too. It happens to survive on a Tcl built with
+        threading, which is why it never failed here, but it is the classic
+        cause of a tkinter app that crashes on one machine and nobody else's.
+        Everything now goes back to the main thread in `_scan_done`.
+        """
         photos = core.find_photos(sources, skip_dirs=(outdir,))
         do_ocr = self.use_ocr.get() and ocr.available()
-        raw_depth = {}
         if not photos:
-            self._q.put(lambda: messagebox.showwarning(APP_TITLE, "No JPEG photos found."))
+            self._q.put(lambda: messagebox.showwarning(
+                APP_TITLE, "No photos found (looked for "
+                           + ", ".join(core.IMAGE_EXT) + ")."))
             return
+        logfile.write(f"scan: {len(photos)} photo(s), ocr={do_ocr}, out={outdir}")
         self._q.put(lambda: self.say(f"Found {len(photos)} photos."))
-        det, coreL, failed = {}, {}, []
+        det, coreL, reads, recovered = {}, {}, {}, []
         for i, p in enumerate(photos, 1):
             self._set_progress(i, len(photos), f"Reading {i} of {len(photos)}")
-            d = core.detect(p)
-            if d is None:
-                failed.append(p); continue
-            det[p] = d
-            crop, _ = core.render(p, d, self.params)
-            coreL[p] = core.core_stats(crop)[0]
-            # Read the bar now, while the FULL-RESOLUTION crop is in hand. The
-            # display strip below is a quarter-size copy and far too small to
-            # read reliably.
-            if do_ocr:
-                raw_depth[p] = ocr.read_depth(core.label_strip(crop))
-            w = 1500
-            d["strip"] = core.label_strip(
-                cv2.resize(crop, (w, max(int(w * crop.shape[0] / crop.shape[1]), 1)),
-                           interpolation=cv2.INTER_AREA))
-        self.photos = [p for p in photos if p in det]
-        self.det, self.core_L = det, coreL
+            try:
+                d = core.detect(p)
+                if d is None:
+                    # Do not drop it. A photo the tray finder cannot read used
+                    # to be logged as "skipped" and then vanish, with no way to
+                    # rescue it from inside the app. It now arrives with a
+                    # default box the corner handles can be dragged onto.
+                    d = core.manual_detect(p)
+                    if d is None:
+                        logfile.write(f"  unreadable file: {p}")
+                        continue
+                    recovered.append(p)
+                det[p] = d
+                crop, _ = core.render(p, d, self.params, reduce=SCAN_REDUCE)
+                coreL[p] = core.core_stats(crop)[0]
+                if do_ocr:
+                    reads[p] = ocr.read_label(
+                        core.label_strips(crop, d, self.params))
+                w = 1500
+                d["strip"] = core.label_strip(
+                    cv2.resize(crop, (w, max(int(w * crop.shape[0] / crop.shape[1]), 1)),
+                               interpolation=cv2.INTER_AREA))
+                logfile.write(
+                    f"  {os.path.basename(p)}: bar={d['bar_method']} "
+                    f"tilt={d['angle']:+.2f} tray_px={d['tray_px']} "
+                    f"L={coreL[p]:.1f} read={reads.get(p)}")
+            except Exception:
+                logfile.exception(f"scan {p}")
+        ordered = [p for p in photos if p in det]
+        self._q.put(lambda: self._scan_done(ordered, det, coreL, reads,
+                                            recovered, do_ocr))
+
+    def _scan_done(self, photos, det, coreL, reads, recovered, do_ocr):
+        """Main thread. Builds all the tkinter state."""
+        self.photos, self.det, self.core_L = photos, det, coreL
+        self.recovered = set(recovered)
+        self._det_lock = False          # new data is in place; previews may draw
+
+        # Seed the tray width from what was actually measured, so a different
+        # camera height does not silently crop every photo wrong until somebody
+        # finds the slider. Across 19 UG26ZOP photos the detected width sat
+        # between 712 and 742 px against a hard-coded default of 744.
+        widths = [d["tray_px"] for p, d in det.items() if p not in self.recovered]
+        if len(widths) >= 3:
+            auto = int(np.median(widths))
+            if 560 <= auto <= 900 and abs(auto - self.params.tray_width) > 4:
+                self.params.tray_width = auto
+                try:
+                    self.sl.set(auto)
+                except Exception:
+                    pass
+                self.say(f"Tray width measured at {auto} px "
+                         f"(slider moved; adjust it if the box looks wrong).")
+
+        # Lock the whole batch to one tray shape, measured from the photos the
+        # shape check passed. The bottom rail is the least reliable edge, and
+        # letting it set each crop's height independently is what produced a
+        # set at aspects 2.15, 2.55 and 4.09. With it locked every photo in a
+        # batch comes out on an identical canvas.
+        good = [d["tray_aspect"] for d in det.values() if d.get("aspect_ok")]
+        if len(good) >= 3:
+            self.params.tray_aspect = float(np.median(good))
+            self.say(f"Tray shape measured at {self.params.tray_aspect:.2f} "
+                     f"(width ÷ height) from {len(good)} photos; every crop in "
+                     f"this batch will use it, so they all come out the same size.")
+
+        # Each photo says whether the box it found has the right SHAPE for a
+        # core tray. That is a far better health check than the spread of
+        # measured widths, because it judges each photo on its own.
+        shaky = [p for p, d in det.items() if not d.get("aspect_ok", True)]
+        methods = {}
+        for d in det.values():
+            methods[d.get("mask_method", "?")] = methods.get(d.get("mask_method", "?"), 0) + 1
+        if methods:
+            self.say("  tray found by: " +
+                     ", ".join(f"{k} on {v}" for k, v in sorted(methods.items())))
+        if shaky:
+            self.say("")
+            self.say(f"  ! {len(shaky)} of {len(det)} photo(s) gave a box that is "
+                     f"the wrong shape for a core tray, so the crop on those is "
+                     f"probably wrong.")
+            self.say("    Fix the box on ONE photo in step 2, then press "
+                     "\"Use this box for every photo in this folder\" - it "
+                     "re-anchors on each photo's own label bar.")
+            logfile.write(f"shape check failed on {len(shaky)}/{len(det)}: "
+                          + ", ".join(os.path.basename(p) for p in shaky[:8]))
 
         by = {}
         for p in self.photos:
@@ -521,11 +668,12 @@ class App(_Root):
             self.folders[name] = fs
 
         if do_ocr:
-            self._apply_ocr(raw_depth)
+            self._apply_reads(reads)
 
         def finish():
-            for p in failed:
-                self.say(f"  no tray found in {os.path.basename(p)} - skipped")
+            for p in sorted(self.recovered):
+                self.say(f"  no tray found in {os.path.basename(p)} - added with a "
+                         f"default box, drag its corners on step 2")
             cut = sum(1 for p in self.photos
                       if self.det[p]["cut_left"] or self.det[p]["cut_right"])
             self.say(f"Detected trays in {len(self.photos)} photos.")
@@ -542,23 +690,35 @@ class App(_Root):
             if self.folders:
                 self.folder_pick.current(0)
             self._show_folder()
-            self._set_idx(0)
+            # Select the tab and let it lay out BEFORE the first draw. On an
+            # unmapped canvas winfo_width() is 1, so the photo was scaled to a
+            # fallback 560x400 and the crop handles sat away from the box.
             self.nb.select(self.tab2)
+            self.update_idletasks()
+            self._set_idx(0)
             self.status.configure(text="Scan complete")
-        self._q.put(finish)
+        finish()
 
-    def _apply_ocr(self, raw_depth):
-        """Put the readings into the table.
+    def _apply_reads(self, reads):
+        """Put the label readings into the table. Main thread only.
 
-        Grouped BY TRAY, not by photo. Both shots of a tray carry the same
-        number, so a per-photo depth check rejects the second one every time
-        (the gap to the previous reading is zero). Grouping also means one good
-        read covers its partner, which measurably lifts the fill rate.
+        TRAY numbers are filled first, then depths are grouped BY TRAY. Both
+        shots of a tray carry the same depth, so a per-photo sequence check
+        rejects the second one every time - the gap to the previous reading is
+        zero. Grouping also lets one good read cover its partner.
 
         Everything lands amber - unconfirmed - until a human passes over it.
+        The hole name is never touched: the reader does not read hole numbers
+        (see ocr.read_label for why), and the folder name is a better guess.
         """
-        filled = 0
+        filled_t = filled_d = 0
         for fs in self.folders.values():
+            for r in fs.rows:
+                t = (reads.get(r["src"]) or {}).get("tray")
+                if t is not None and str(t) != r["tray"].get():
+                    r["tray"].set(str(t))
+                    r["tray_confirmed"] = False
+                    filled_t += 1
             trays = {}
             for r in fs.rows:
                 try:
@@ -566,33 +726,31 @@ class App(_Root):
                 except ValueError:
                     continue
                 trays.setdefault(t, []).append(r)
-            prev = None
+            prev = prev_t = None
             for t in sorted(trays):
                 rows = trays[t]
-                seen = [raw_depth.get(r["src"]) for r in rows]
+                seen = [(reads.get(r["src"]) or {}).get("depth") for r in rows]
                 seen = [v for v in seen if v is not None]
                 if not seen or len(set(seen)) > 1:
                     continue          # nothing read, or the two shots disagree
-                v = ocr.veto_depth(seen[0], prev)
+                # How many trays back the comparison depth came from. Without
+                # this the window stays one tray wide while the real gap grows,
+                # so a single unread tray rejects every tray after it.
+                since = 1 if prev_t is None else max(t - prev_t, 1)
+                v = ocr.veto_depth(seen[0], prev, trays_since=since)
                 if v is None:
                     continue          # cannot be right given the previous tray
-                prev = v
+                prev, prev_t = v, t
                 for r in rows:
                     r["depth"].set(f"{v:.2f}")
                     r["confirmed"] = False
-                    filled += 1
-            h, _ = ocr.read_hole_and_tray(self.det[fs.photos[0]].get("strip")) \
-                if fs.photos else (None, None)
-            if h and not fs.hole.get().startswith("DD26ZOP-"):
-                fs.hole.set(f"DD26ZOP-{h}")
+                    filled_d += 1
+        for fs in self.folders.values():
+            self._seed_start(fs)
         total = sum(len(fs.rows) for fs in self.folders.values())
-        self._q.put(lambda: self.say(
-            f"  filled {filled} of {total} depth boxes from the label bars "
-            f"(amber = unchecked, please look them over)"))
-
-    # ------------------------------------------------------------- preview
-
-    # ------------------------------------------------------------- preview
+        self.say(f"  read {filled_d} of {total} depths and {filled_t} tray numbers "
+                 f"off the label bars (amber = unchecked, please look them over)")
+        logfile.write(f"reads: depths {filled_d}/{total}, trays {filled_t}/{total}")
 
     # ------------------------------------------------------------- preview
     def _step(self, k):
@@ -621,29 +779,50 @@ class App(_Root):
             self.adj[self.photos[self.preview_idx]] = [[0.0, 0.0] for _ in range(4)]
             self._draw_preview()
 
-    def _apply_adj_all(self):
-        """Same nudge on every photo of this folder - for a rig that is
-        consistently off rather than one crooked photo."""
+    def _apply_box_all(self):
+        """Calibrate the whole folder from the box on screen.
+
+        This used to copy the four corner NUDGES verbatim. That only helps if
+        every photo's automatic box was wrong in the same way, and it is not:
+        the label bar is a loose steel bar that shifts between shots, so the
+        right box sits at a different height in each frame.
+
+        Instead the corrected box is stored as a rule - keep its width and
+        height, re-anchor the top on each photo's OWN detected bar - which
+        follows the bar. Measured against four hand-corrected DD_ZOP_014 crops,
+        calibrating from any one of them landed the other three to within 1.2%
+        of the tray width; per-photo automatic detection was out by 13%.
+        """
         if not self.photos:
             return
         cur = self.photos[self.preview_idx]
-        adj = [list(c) for c in self._cur_adj(cur)]
         folder = os.path.dirname(cur)
+        prof = core.profile_from_quad(self.det[cur], self.params, self._cur_adj(cur))
+        self.profiles[folder] = prof
         n = 0
         for p in self.photos:
             if os.path.dirname(p) == folder:
-                self.adj[p] = [list(c) for c in adj]
+                self.adj.pop(p, None)        # the profile replaces per-photo nudges
                 n += 1
-        self.adj_lbl.configure(text=f"copied to {n} photos in this folder")
+        self.adj[cur] = [[0.0, 0.0] for _ in range(4)]
+        self.adj_lbl.configure(
+            text=f"this box now sets all {n} photos in the folder (re-anchored "
+                 f"on each one's label bar)")
+        logfile.write(f"calibrated folder {folder}: {prof}")
+        self._draw_preview()
+
+    def _prof(self, path=None):
+        path = path or (self.photos[self.preview_idx] if self.photos else None)
+        return self.profiles.get(os.path.dirname(path)) if path else None
 
     def _canvas_quad(self):
         p = self.photos[self.preview_idx]
-        q = core.crop_quad(self.det[p], self.params, self._cur_adj(p))
+        q = core.crop_quad(self.det[p], self.params, self._cur_adj(p), self._prof(p))
         s, ox, oy = self._pv["s"], self._pv["ox"], self._pv["oy"]
         return [(ox + x * s, oy + y * s) for x, y in q]
 
     def _grab(self, ev):
-        if not self.photos or not self._pv:
+        if self._busy or not self.photos or not self._pv:
             return
         pts = self._canvas_quad()
         for i, (cx, cy) in enumerate(pts):
@@ -657,7 +836,7 @@ class App(_Root):
         self._last = (ev.x, ev.y)
 
     def _drag_move(self, ev):
-        if self._drag is None or not self._pv:
+        if self._busy or self._drag is None or not self._pv:
             return
         s = self._pv["s"]
         dx, dy = (ev.x - self._last[0]) / s, (ev.y - self._last[1]) / s
@@ -688,10 +867,17 @@ class App(_Root):
         self.adj_lbl.configure(text="corners adjusted on this photo" if moved else "")
 
     def _draw_preview(self):
-        if not self.photos:
+        # A scan replaces self.det wholesale. Dragging a corner while that is
+        # happening used to raise a KeyError from the canvas binding, which is
+        # not disabled by the button states. The guard is _det_lock and not
+        # _busy so that the first preview of a finished scan can be drawn from
+        # inside _scan_done, which runs while _busy is still set.
+        if self._det_lock or not self.photos:
             return
         p = self.photos[self.preview_idx]
-        d = self.det[p]
+        d = self.det.get(p)
+        if d is None:
+            return
         small = d["small"]
         cw = max(self.cv_orig.winfo_width(), 560)
         ch = max(self.cv_orig.winfo_height(), 400)
@@ -711,10 +897,12 @@ class App(_Root):
 
         pr = core.Params(**{**self.params.to_dict(),
                             "normalise": self.params.normalise and not self.show_raw.get()})
-        crop, gains = core.render(p, d, pr, self._cur_adj(p))
+        crop, gains = core.render(p, d, pr, self._cur_adj(p), prof=self._prof(p))
         self._img2 = cv_to_tk(crop, 540, 400)
         self.cv_res.configure(image=self._img2)
-        msg = (f"tilt {d['angle']:+.2f}°    label bar offset {int(d['bb'][3]) - d['bar']} px"
+        msg = (f"tilt {d['angle']:+.2f}°    tray found by {d.get('mask_method','?')}"
+               f"    shape {d.get('tray_aspect','?')}"
+               f"{'' if d.get('aspect_ok', True) else ' (WRONG SHAPE - check this box)'}"
                f"    output {crop.shape[1]}×{crop.shape[0]} px")
         if gains:
             msg += f"    colour gains B/G/R {gains[0]:.2f}/{gains[1]:.2f}/{gains[2]:.2f}"
@@ -726,10 +914,30 @@ class App(_Root):
     def _cur(self):
         return self.folders.get(self.folder_pick.get())
 
+    @staticmethod
+    def _seed_start(fs):
+        """Tray 1 starts at 0.00 m. Nobody should have to type that.
+
+        Only ever fills an EMPTY field: a hole that carries on from a previous
+        run starts somewhere else, and a start depth already typed - or
+        already seeded and then corrected - must win over the default.
+        """
+        if fs.first_start.get().strip():
+            return
+        trays = []
+        for r in fs.rows:
+            try:
+                trays.append(int(r["tray"].get()))
+            except ValueError:
+                pass
+        if trays and min(trays) == 1:
+            fs.first_start.set("0.00")
+
     def _show_folder(self):
         fs = self._cur()
         if not fs:
             return
+        self._seed_start(fs)
         self.hole_entry.configure(textvariable=fs.hole)
         self.start_entry.configure(textvariable=fs.first_start)
         self._build_rows()
@@ -755,7 +963,14 @@ class App(_Root):
             # pack_propagate(False) collapses and squashes the widget inside it
             b1 = tk.Frame(row, width=74, height=ROW_H)
             b1.pack(side="left"); b1.pack_propagate(False)
-            ttk.Entry(b1, textvariable=r["tray"], width=5, justify="center").pack(expand=True)
+            te = tk.Entry(b1, textvariable=r["tray"], width=5, justify="center",
+                          relief="solid", bd=1,
+                          bg=CONFIRMED_BG if r.get("tray_confirmed", True)
+                          else UNCONFIRMED_BG)
+            te.pack(expand=True)
+            r["tray_entry"] = te
+            te.bind("<FocusIn>", lambda ev, rr=r: self._confirm_tray(rr))
+            te.bind("<Key>", lambda ev, rr=r: self._confirm_tray(rr))
             b2 = tk.Frame(row, width=124, height=ROW_H)
             b2.pack(side="left"); b2.pack_propagate(False)
             e = tk.Entry(b2, textvariable=r["depth"], width=11, relief="solid", bd=1,
@@ -771,6 +986,7 @@ class App(_Root):
                          values=("Auto", "Dry", "Wet")).pack(expand=True)
             ttk.Label(row, text=os.path.basename(r["src"]),
                       style="Hint.TLabel").pack(side="left", padx=4, expand=True)
+        self._bind_wheel(self.rowsf)
 
     @staticmethod
     def _col(parent, text, w):
@@ -784,6 +1000,14 @@ class App(_Root):
             r["confirmed"] = True
             try:
                 r["entry"].configure(bg=CONFIRMED_BG)
+            except tk.TclError:
+                pass
+
+    def _confirm_tray(self, r):
+        if not r.get("tray_confirmed", True):
+            r["tray_confirmed"] = True
+            try:
+                r["tray_entry"].configure(bg=CONFIRMED_BG)
             except tk.TclError:
                 pass
 
@@ -823,6 +1047,15 @@ class App(_Root):
             probs.append("Start depth of the first tray is not a number.")
         return fs.hole.get().strip(), groups, ends, first, overrides, probs
 
+    def blocking(self):
+        """Problems that must not be overridable - see naming.blocking_problems."""
+        out = []
+        for rel, fs in self.folders.items():
+            hole, groups, ends, first, _, probs = self._collect(fs)
+            for m in naming.blocking_problems(hole, groups, ends, first):
+                out.append(f"[{rel}] {m}")
+        return out
+
     def validate(self, silent=False):
         """Validate EVERY scanned folder, not just the one on screen."""
         allp = []
@@ -845,12 +1078,33 @@ class App(_Root):
         if not self.folders:
             messagebox.showwarning(APP_TITLE, "Scan some photos first.")
             return
-        unconf = sum(1 for fs in self.folders.values() for r in fs.rows if not r["confirmed"])
+        stop = self.blocking()
+        if stop:
+            # Not a yes/no. Each of these puts a wrong number into a filename
+            # or writes a file with no hole name, and neither is visible in the
+            # output afterwards.
+            messagebox.showerror(
+                APP_TITLE,
+                "These have to be fixed before anything can be saved:\n\n• "
+                + "\n• ".join(stop[:10])
+                + "\n\nA missing end depth is not skippable: every tray below "
+                  "it would be named with a start depth that is not its own.")
+            self.nb.select(self.tab3)
+            return
+        unconf = sum(1 for fs in self.folders.values() for r in fs.rows
+                     if not r["confirmed"] or not r.get("tray_confirmed", True))
         problems = self.validate(silent=True)
         warn = list(problems)
         if unconf:
-            warn.insert(0, f"{unconf} depth(s) are still OCR guesses you have not checked "
-                           f"(the amber boxes).")
+            warn.insert(0, f"{unconf} box(es) are still reader guesses you have not "
+                           f"checked (the amber ones).")
+        if self.recovered:
+            warn.insert(0, f"{len(self.recovered)} photo(s) had no tray detected and "
+                           f"use a default crop box.")
+        outdir_now = self.outdir.get().strip()
+        if outdir_now and os.path.isdir(outdir_now) and os.listdir(outdir_now):
+            warn.append(f"{outdir_now} already has files in it; "
+                        f"any with the same name will be overwritten.")
         if warn and not messagebox.askyesno(
                 APP_TITLE, "Before saving:\n\n• " + "\n• ".join(warn[:10]) +
                            "\n\nProcess anyway?"):
@@ -865,7 +1119,7 @@ class App(_Root):
         total = sum(len(s) for _, _, groups, _, _, _ in
                     [(j[0], j[1], j[2], j[3], j[4], j[5]) for j in jobs]
                     for s in groups.values())
-        n, written, per_hole = 0, [], {}
+        n, written, per_hole, skipped = 0, [], {}, []
         for rel, hole, groups, ends, first, overrides in jobs:
             hole = hole or (rel or "hole")
             chained = naming.chain_depths(sorted(groups), ends,
@@ -874,8 +1128,14 @@ class App(_Root):
             for tray in sorted(groups):
                 srcs = groups[tray]
                 start, end = chained[tray]
-                if end is None:
+                if end is None or start is None:
+                    # Cannot happen via the button - run() blocks first - but a
+                    # silent `continue` here is what turned a missing depth into
+                    # a wrongly-named neighbour, so say so rather than drop it.
                     n += len(srcs)
+                    skipped.append((hole, tray, len(srcs)))
+                    logfile.write(f"  SKIPPED {hole} tray {tray}: "
+                                  f"start={start} end={end}")
                     continue
                 conds, margin = naming.decide_conditions(srcs, self.core_L, overrides)
                 names = naming.disambiguate(
@@ -883,7 +1143,9 @@ class App(_Root):
                 for s, name in zip(srcs, names):
                     n += 1
                     self._set_progress(n, total, f"Saving {n} of {total}")
-                    crop, gains = core.render(s, self.det[s], self.params, self.adj.get(s))
+                    crop, gains = core.render(s, self.det[s], self.params,
+                                              self.adj.get(s),
+                                              prof=self.profiles.get(os.path.dirname(s)))
                     dst = os.path.join(outdir, hole, conds[s], name)
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     cv2.imwrite(dst, crop, [cv2.IMWRITE_JPEG_QUALITY, self.params.jpeg_quality])
@@ -895,12 +1157,21 @@ class App(_Root):
                         interval_m=round(end - start, 2), condition=conds[s],
                         overridden=int(s in overrides),
                         dry_wet_margin_L=round(margin, 1),
-                        confidence="high" if margin >= 12 or s in overrides else "check",
+                        confidence=("high" if margin >= DRY_WET_MARGIN or s in overrides
+                                    else "check"),
                         core_L=round(self.core_L.get(s, 0), 1),
                         tilt_deg=round(d["angle"], 2),
+                        bar_method=d.get("bar_method", ""),
+                        mask_method=d.get("mask_method", ""),
+                        tray_aspect=d.get("tray_aspect", ""),
+                        shape_ok=int(bool(d.get("aspect_ok", True))),
+                        tray_px=d.get("tray_px", ""),
+                        auto_detect_failed=int(bool(d.get("auto_failed"))),
+                        tool_version=__version__,
                         tray_cut_left=d["cut_left"], tray_cut_right=d["cut_right"],
                         corners_adjusted=int(any(abs(v) > 0.5 for pt in
                                                  self.adj.get(s, []) for v in pt)),
+                        folder_calibrated=int(os.path.dirname(s) in self.profiles),
                         gain_B=round(gains[0], 3) if gains else "",
                         gain_G=round(gains[1], 3) if gains else "",
                         gain_R=round(gains[2], 3) if gains else ""))
@@ -911,11 +1182,18 @@ class App(_Root):
                 per_hole[hole] = (len(manifest), [m["final"] for m in manifest
                                                   if m["confidence"] != "high"])
 
+        logfile.write(f"run: wrote {len(written)} file(s) to {outdir}; "
+                      f"{len(skipped)} tray(s) skipped")
+
         def finish():
             self.status.configure(text="Done")
             lines = [f"{h}: {c} images" + (f"  ({len(chk)} to check by eye)" if chk else "")
                      for h, (c, chk) in per_hole.items()]
             msg = "Saved to\n" + outdir + "\n\n" + "\n".join(lines)
+            if skipped:
+                msg += ("\n\nNOT saved, because the depth chain was broken:\n  "
+                        + "\n  ".join(f"{h} tray {t} ({c} photo(s))"
+                                      for h, t, c in skipped))
             chk_all = [c for _, chk in per_hole.values() for c in chk]
             if chk_all:
                 msg += ("\n\nDry/wet was a close call on these (usually a near-empty tray). "

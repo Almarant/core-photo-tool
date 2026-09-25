@@ -1,1 +1,2 @@
-__version__ = "1.0.0"
+"""Core Photo Tool."""
+__version__ = "1.6.0"

@@ -10,6 +10,233 @@ Output: `DD26ZOP-006_Dry_Tray22_82.50-86.00m.jpg`
 
 ---
 
+## What changed in 1.6.0
+
+Three things reported from a full 48-photo run of DD_ZOP_015, all of them in
+the window rather than in the image work.
+
+**The first photo of a scan came up blank.** You had to press Next and then
+Back to see it. `_scan_done` runs on the main thread, but it is queued *before*
+the callback that clears the busy flag — and the preview was guarded by that
+same flag, so the one draw it asked for was thrown away. The guard now tests a
+separate lock that `_scan_done` clears itself, the moment the new detection
+results are in place. The tab is also selected and laid out before that first
+draw: on an unmapped canvas `winfo_width()` returns **1 px**, so the photo was
+being scaled to a fallback size and the crop handles sat away from the box.
+
+**The wheel did nothing over the label table on step 3.** Only the canvas and
+its frame were bound, and once the rows are built they cover the canvas
+completely — the pointer is always over a child widget, so the event never
+reached anything that could scroll. Every widget in the table is bound now.
+That also fixes something worse and quieter: ttk binds the wheel on a combobox
+to **change its value**, so a scroll that landed on the Dry/Wet column was
+editing the data. The handler returns `break`, which stops that.
+
+**Tray 1 starts at 0.00 m by itself.** If the lowest tray number on the table
+is 1, the start depth is filled in. It only ever fills an empty field, so a
+hole that carries on from a previous run keeps whatever you typed, and a hole
+whose first tray is tray 5 is left alone.
+
+Four window-level checks were added (`tests/test_gui.py`, run under a virtual
+display) — each one fails on 1.5.0 and passes here.
+
+## What changed in 1.5.0
+
+Two bugs, both of which made the reader look far worse than it was.
+
+**One unread tray was discarding every depth after it.** The depth column
+stopped at tray 3 of 24. The sequence check compares each reading against the
+previous tray's end depth, but it only advances that reference when a tray is
+actually read — while still allowing a one-tray gap. Tray 4 was not read, so
+trays 6 to 24 were all measured against tray 3's 12.90 m, every gap broke the
+8 m ceiling, and **21 correctly-read depths were thrown away**. The window now
+widens by however many trays were skipped. On the same data: 3 of 24 → **22 of
+24**, with backwards jumps and wild values still rejected.
+
+**The white depth markers standing in the core were being read as the label
+bar.** They look exactly like stencil tiles — bright, solid, sharing a
+baseline, dark between them. On IMG_0475 the pale cover pushed the brightness
+threshold to 172 while the tiles on the rusty bar peak at 210, so the real bar
+was never found and the marker row 190 px lower was the only candidate; the
+crop then started below the core and ran off the bottom of the frame. The tile
+finder now pools candidates from several thresholds and takes the topmost that
+passes every test. The dark-background test is what keeps the extra sensitivity
+safe — rows lying on the cover, on the tape or on pale core are still thrown
+out.
+
+Measured over the 17 DD_ZOP_015 photos checked here: **one output size**, shape
+check failed on none, tray number 16/17, end depth filled 15/17 with nothing
+read wrongly.
+
+## What changed in 1.4.0
+
+Found by running 1.3.0 over all 48 photos of DD_ZOP_015 and comparing the saved
+crops against the boxes that had to be corrected by hand.
+
+**The label bar was being resolved against the tray mask, and inherited its
+mistakes.** Candidates were filtered by the mask's box, the gradient detector
+searched a window derived from it, and whichever answer sat *higher* in the
+frame won. So whenever the two segmentation hypotheses tied and the box
+flipped, the bar moved with it — up to 47 px, which is roughly **400 px of
+bench and cover above the tray** in the finished crop. That is the "large area
+above the tray" on 12 of the 48.
+
+The tile detector needs no box at all: it looks at the stencil tiles directly.
+Measured against nine hand-corrected crops, it places the top edge with **sd
+2.6 px** against 14.8 for the old rule, so it is now authoritative wherever the
+tiles are found, and the gradient is strictly a fallback for frames where they
+cannot be. Worst-corner error across those nine: **52 px → 11 px**.
+
+**The depth reader now tries nine strip heights instead of three.** Where the
+lettering falls inside the crop moves with how much bar the frame caught, and a
+given photo often reads at only one or two heights — one read only at 0.12,
+another only at 0.26. Slices are cheap, and two that disagree still veto each
+other, so more attempts cannot become more guesses.
+
+Measured on the photos checked here: end depth **6/48 → 9 of 12**, tray number
+**11 of 12**, nothing read wrongly.
+
+**Dry/wet on tray 3 fixed itself.** It was being decided on a crop that
+included a strip of bench, which shifted the rock luminance. With the crop
+right, the call is correct. Chroma was tested as a second cue and rejected — it
+got tray 2 wrong.
+
+One thing worth knowing: on IMG_0479 the bar physically reads `37·70` while
+your corrected depth is 39.20. The reader was right and the label is wrong —
+worth a look at that box.
+
+## What changed in 1.3.0
+
+**Put a pale cover under the core box.** It works, and the tool now uses it.
+
+Measured on DD_ZOP_015, the cover sits **37–45 L\* above the tray**, against
+19 L\* for a bare wooden bench. But 1.2.0 could not exploit that, because it
+segments on *colour*, not brightness — which is why many of those photos came
+out uncropped.
+
+- **A second tray finder, by brightness.** The cover is one bright region that
+  surrounds the box and touches the frame edge, so flood-filling inwards from
+  the border marks the background, and whatever it cannot reach is the tray —
+  pale core included. (Thresholding "dark = tray" does not work: pale core is
+  as bright as the cover. The measuring tape also spans the tray and lets the
+  fill straight through, cutting it in half, so it is bridged.)
+- **The tool picks the method per photo, automatically.** A core tray crop has
+  a fixed shape — measured at 2.94–2.98 across three different rigs — so
+  whichever segmentation produces a tray-shaped, densely-filled box wins. On
+  the covered batch brightness wins 11 of 12; on teal trays against concrete
+  colour still wins 18 of 19.
+- **Every crop in a batch now comes out the same size.** The tray's height is
+  derived from its width and the batch's measured shape, rather than from the
+  detected bottom rail — the least reliable edge, and the one that produced a
+  set at aspects 2.15, 2.55 and 4.09. Verified: one canvas for all 12 covered
+  photos, one for all 19 UG photos.
+- **Photos whose box is the wrong shape are flagged, not silently cropped.**
+  The scan log says how many and tells you to calibrate the folder from one
+  corrected photo.
+
+Knock-on: with correct crops, the label reader went from about a third of tray
+numbers on this material to **10 of 12**.
+
+**Best practice for photographers:** keep using the cover, and make sure it
+extends past all four edges of the box in frame. That is what lets the tool
+find the tray without anyone touching a slider.
+
+## What changed in 1.2.0
+
+Found by running 1.1.0 on DD_ZOP_014 — a hole shot on **different equipment**
+(grey steel trays on a wooden bench, not teal plastic on concrete). Every crop
+had to be corrected by hand.
+
+**The tray finder cannot segment that rig, and neither could the old version.**
+It thresholds the CIELAB b\* channel on the assumption that a cool teal tray
+stands out against warm concrete. Measured on these photos the tray sits at
+b\* = −11.5 and the bench at −10.3: no separation at all. The mask then covers
+47–75% of the frame and the box is wrong by up to 13% of the tray width, in a
+different way on each photo. It is also **unstable** — re-saving one frame at
+three JPEG qualities moved its detected box to three completely different
+places.
+
+Nothing in the image reliably distinguishes "the mask worked" from "the mask
+failed", so the app no longer pretends otherwise:
+
+- **Fix one photo, calibrate the folder.** The old "copy this adjustment to
+  every photo" copied absolute corner offsets, which cannot work: the label bar
+  is loose and sits at a different height in every frame. The button is now
+  **"Use this box for every photo in this folder"**, and it stores the corrected
+  box as a rule — same width and height, top re-anchored on each photo's own
+  detected bar. Measured against four hand-corrected DD_ZOP_014 crops,
+  calibrating from any one of them placed the other three to within **1.2% of
+  the tray width**. Automatic detection on the same four was out by **13%**.
+- **The app now warns you** when the measured tray width wanders by more than
+  8% across a batch, and tells you to calibrate. DD_ZOP_014 varies by 15%; a
+  batch the finder handles varies by 4%.
+
+**Stretching is fixed.** The output canvas was locked to the *automatic* box
+while the quad actually being sampled followed your corners, so moving them
+changed the scale and squashed the picture — three DD_ZOP_014 crops of the same
+physical tray came out at aspect 2.15, 2.55 and 4.09. The canvas now follows the
+quad at a constant millimetres-per-pixel, which is what "constant scale" was
+always supposed to mean. After calibration those four crops come out identical
+at 5920×2016.
+
+**The label reader was never the problem on that hole.** It was reading a strip
+cut from a bad crop. On correctly cropped DD_ZOP_014 photos it reads **4 of 4
+depths and 3 of 4 tray numbers** correctly.
+
+## What changed in 1.1.0
+
+Field-tested on a second hole type (UG26ZOP, underground, 40 photos on a
+different rig), which broke several things the original DD26ZOP set never
+touched.
+
+**Fixed, in order of how much damage each could do**
+
+1. **A missing end depth used to mislabel the trays below it.** Leaving Tray 2
+   blank produced `..._Tray3_4.95-10.20m.jpg` for a tray that actually began at
+   7.65 m: the chain carried the last known depth forward. A wrong start depth
+   baked into a filename is invisible afterwards. Missing depths now break the
+   chain and **block** processing instead of warning.
+2. **Wet trays lost their label bar.** The bar was found by the steepest
+   darkening above the tray; on a wet tray the dark core is a stronger edge, so
+   the crop came out with the text sliced off (6 of 42 photos). A second
+   detector now looks for the stencil tiles themselves.
+3. **A failed tilt fit rotated the label out of frame.** One photo measured
+   3.36° when every real tilt is under 1.2°. Steep fits are now discarded.
+4. **tkinter objects were being created and written from a worker thread.** It
+   survives on a threaded Tcl build, which is why it never failed here, but it
+   is the classic cause of an app that crashes on one colleague's machine only.
+5. **The hole-ID guess was hard-coded to `DD26ZOP-`.** Removed.
+6. **Output-folder skipping matched folder NAMES**, so any source subfolder
+   called `processed` was silently dropped.
+7. **Dragging a crop corner during a re-scan** could raise a KeyError.
+
+**New**
+
+- The label reader now fills in **tray numbers** as well as depths.
+- **Tray width is measured from your photos** instead of assuming 744 px, so a
+  different camera height no longer crops everything wrong until you find the
+  slider.
+- Photos where no tray is found are **kept**, with a default box you can drag,
+  instead of being skipped and lost.
+- **A log file** at `%LOCALAPPDATA%\CorePhotoTool\log.txt` — one line per photo
+  with the detection numbers. Send it when something goes wrong.
+- Scanning is **~2.5× faster** (15.5 s → 6.1 s for 19 photos): it no longer
+  renders every photo at full resolution twice.
+- Tests now include **four real photo fixtures**, so the tray finder, deskew and
+  bar detection are actually covered. Every bug above passed the old test suite.
+- PNG and TIFF are accepted, not only JPEG.
+- The version is in the title bar and in every manifest row.
+
+**Known limits**
+
+- The reader fills about **two thirds of depths and a third of tray numbers** on
+  the UG26ZOP set, with **nothing read wrongly**. It was 93% on DD26ZOP; the UG
+  photos frame the bar differently. Blank means "look at it yourself", which is
+  the intended failure.
+- The hole number is deliberately **not** read off the bar. It can be, but on
+  UG26ZOP it came back confidently wrong on 5 photos of 19, and you only type
+  the hole once per folder.
+
 ## For geologists — just use it
 
 1. Download **CorePhotoTool.exe** from the
@@ -117,6 +344,11 @@ That decision was measured, not assumed. Over 72 real DD26ZOP labels:
 | Tesseract, best configuration | 38% | 56% | **6%** |
 | built-in digit reader | 93% | 7% | **0%** |
 
+On the later UG26ZOP set (different rig, different framing) the built-in reader
+gets about 68% of depths and 32% of tray numbers, still with nothing read
+wrongly. The gap is region-finding, not character recognition: when the reader
+can locate the number it almost always reads it correctly.
+
 A general OCR engine has to cope with any font; recognising one known alphabet is
 a far easier problem, and it needs no installation and adds no 50 MB to the
 download.
@@ -159,6 +391,8 @@ corephoto/core.py     detection, deskew, crop, colour normalisation, rock stats
 corephoto/naming.py   grouping, dry/wet, depth chaining, filenames, validation
 corephoto/glyphs.py   built-in digit reader (locate, segment, classify)
 corephoto/glyph_templates.npz   digit templates, trained on this project's labels
+corephoto/barfind.py  label-bar location: stencil tiles + darkening gradient
+corephoto/logfile.py  rolling log in the user's AppData folder
 corephoto/ocr.py      reader dispatch + depth-sequence veto; optional Tesseract
 corephoto/app.py      tkinter GUI (sv_ttk theme)
 corephoto/icon.ico    app icon
@@ -177,8 +411,9 @@ python run_app.py
 Depth reading works from source too — the digit reader is part of the package,
 so there is nothing extra to install.
 
-Tesseract is optional and only used as a fallback, plus for the hole ID and tray
-number. If you want it, run `install_tesseract.bat`. The app looks for it in the
+Tesseract is optional and only used as a depth fallback. Nothing needs it — the
+built-in reader covers tray numbers and depths, and the hole ID is typed once
+per folder. The app looks for it in the
 copy bundled in the .exe → a path you chose with **Locate tesseract.exe…**
 (remembered in `%LOCALAPPDATA%\CorePhotoTool\settings.json`) → `PATH` → the
 usual Windows install folders → the registry. The Windows installer often does

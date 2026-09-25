@@ -36,6 +36,15 @@ jobs:
       - name: Sanity check (imports and pure logic, no GUI)
         run: python -m tests.test_logic
 
+      # The runner has a desktop session, so the window itself can be built
+      # and driven. These four checks cover defects that are invisible to the
+      # logic suite because they live in tkinter's event and geometry
+      # plumbing: a blank first preview, a canvas measured before it was laid
+      # out, the wheel not reaching the label table, and the tray-1 start
+      # depth. Each one failed on 1.5.0.
+      - name: Window checks
+        run: python -m tests.test_gui
+
       # No Tesseract step. Label reading is done by corephoto/glyphs.py,
       # trained on the project's own stencil tiles: better on this material
       # (93% vs 38% correct) and ~50 MB smaller than bundling an OCR engine.

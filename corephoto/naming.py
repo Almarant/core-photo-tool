@@ -57,13 +57,21 @@ def decide_conditions(sources, core_L, overrides=None):
 
 def chain_depths(trays, ends, first_start):
     """trays: sorted tray numbers. ends: {tray: end_depth}.
-    Returns {tray: (start, end)} with each tray starting where the last ended."""
+    Returns {tray: (start, end)}, each tray starting where the last one ended.
+
+    A tray with no end depth POISONS every tray below it: its own end is
+    unknown, so the next tray's start is unknown too, and `start` comes back
+    None all the way down. The previous version quietly carried the last known
+    end forward instead, so leaving Tray 2 blank produced a file called
+    `..._Tray3_4.95-10.20m.jpg` when Tray 3 really began at 7.65 - a wrong
+    start depth, baked into a filename, with nothing on screen to say so. That
+    is the one error a geologist cannot catch by looking at the output.
+    """
     out, prev = {}, first_start
     for t in sorted(trays):
         end = ends.get(t)
         out[t] = (prev, end)
-        if end is not None:
-            prev = end
+        prev = end if end is not None else None
     return out
 
 
@@ -84,6 +92,41 @@ def disambiguate(names):
         else:
             seen[n] = 1
             out.append(n)
+    return out
+
+
+def blocking_problems(hole, groups, ends, first_start):
+    """The subset of problems that must NOT be overridable.
+
+    Everything else in `validate` is advice - a gap in tray numbers may be
+    genuine, an odd photo count may be a deliberate reshoot - and the user is
+    right to be able to press on. These three are different: they put a wrong
+    number into a filename, or write a file with no hole name at all, and
+    neither is visible in the output afterwards.
+    """
+    out = []
+    if not hole or any(c in hole for c in '\\/:*?"<>|'):
+        out.append("Hole ID is empty or contains characters that cannot be used "
+                   "in a filename.")
+    if first_start is None:
+        out.append("Start depth of the first tray is missing, so no tray has a "
+                   "known start.")
+    trays = sorted(groups)
+    chained = chain_depths(trays, ends, first_start)
+    missing = [t for t in trays if ends.get(t) is None]
+    if missing:
+        after = [t for t in trays if chained[t][0] is None and t not in missing]
+        msg = ("End depth missing for tray(s) " +
+               ", ".join(str(t) for t in missing) + ".")
+        if after:
+            msg += (" That also leaves tray(s) " + ", ".join(str(t) for t in after) +
+                    " with an unknown start depth.")
+        out.append(msg + " Fill them in - these cannot be skipped.")
+    for t in trays:
+        start, end = chained[t]
+        if start is not None and end is not None and end <= start:
+            out.append(f"Tray {t}: end depth {end:.2f} m is not deeper than its "
+                       f"start depth {start:.2f} m.")
     return out
 
 
@@ -114,6 +157,9 @@ def validate(hole, groups, ends, first_start):
                             f"check the tray numbers on those rows.")
         if end is None:
             problems.append(f"Tray {t}: end depth is missing.")
+        elif start is None:
+            problems.append(f"Tray {t}: start depth is unknown, because an earlier "
+                            f"tray has no end depth.")
         elif end <= start:
             problems.append(f"Tray {t}: end depth {end:.2f} m is not deeper than its "
                             f"start depth {start:.2f} m.")

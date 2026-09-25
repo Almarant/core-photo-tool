@@ -26,7 +26,6 @@ import sys
 import tempfile
 
 import cv2
-import numpy as np
 
 from . import glyphs
 
@@ -198,36 +197,50 @@ def reader_name():
 
 def read_depth(bar):
     """End depth from a label bar, or None. Built-in reader first."""
-    v = glyphs.read_depth(bar) if glyphs.available() else None
+    bars = bar if isinstance(bar, (list, tuple)) else [bar]
+    v = glyphs.read_label(bars).get("depth") if glyphs.available() else None
     if v is None and tesseract_available():
-        v = _tess_depth(bar)
+        v = _tess_depth(bars[0])
     return v
 
 
-def veto_depth(value, prev_end, min_interval=0.3, max_interval=8.0):
+def veto_depth(value, prev_end, min_interval=0.3, max_interval=8.0, trays_since=1):
     """Drop a reading that cannot be right given the previous tray's end depth.
+
+    `trays_since` is how many trays back that previous depth came from. It
+    matters more than it looks: the loop only advances `prev_end` when a tray
+    is actually read, so after one unread tray the comparison is against a
+    depth two trays back, and the window has to widen to match.
+
+    Without it, ONE missed tray poisoned the whole hole. On DD_ZOP_015 tray 4
+    was not read; every tray from 6 to 24 was then measured against tray 3's
+    12.90 m, every gap exceeded the 8 m ceiling, and 21 correctly-read depths
+    were thrown away. Three trays were filled out of twenty-four, and the
+    reader looked broken when it was not.
 
     Only ever rejects. Inventing a correction produces plausible-looking wrong
     numbers, which is worse than an empty box.
     """
     if value is None or prev_end is None:
         return value
-    return value if min_interval <= value - prev_end <= max_interval else None
+    n = max(int(trays_since), 1)
+    gap = value - prev_end
+    return value if (min_interval * n) <= gap <= (max_interval * n) else None
 
 
-def read_hole_and_tray(bar):
-    """Hole suffix and tray number, Tesseract only - weak, a hint for the
-    first row. The built-in reader covers digits, not letters."""
-    if not tesseract_available() or bar is None:
-        return (None, None)
-    g = cv2.cvtColor(bar, cv2.COLOR_BGR2GRAY) if bar.ndim == 3 else bar
-    tile = glyphs._tiles_mask(g)
-    out = np.full_like(g, 255)
-    out[tile > 0] = g[tile > 0]
-    img = cv2.threshold(out, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    t = re.sub(r"\s+", " ", re.sub(r"[|\n]+", " ",
-               _tess_run(img, 6, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-· ").upper()))
-    hole = re.search(r"DD\s*\d{2}\s*Z\s*[O0]\s*P\s*[-\s]*(\d{2,3})", t)
-    tray = re.search(r"T\s*R\s*A\s*Y\s*(\d{1,2})", t)
-    return (hole.group(1) if hole else None,
-            int(tray.group(1)) if tray else None)
+def read_label(bars):
+    """Tray number and end depth from the label bar.
+
+    `bars` may be several slices of the same bar; the reader drops any field
+    the slices disagree on. Returns {"tray": int|None, "depth": float|None}.
+
+    The HOLE number is deliberately not read. It can be segmented off the bar,
+    but on the UG26ZOP set it came back confidently wrong on five photos of
+    nineteen - reading the depth digits as a hole number when the region finder
+    only located one group. The hole is typed once per folder, so that risk
+    buys nothing.
+    """
+    if not glyphs.available():
+        return {"tray": None, "depth": None}
+    lab = glyphs.read_label(bars)
+    return {"tray": lab.get("tray"), "depth": lab.get("depth")}
