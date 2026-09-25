@@ -10,6 +10,61 @@ Output: `DD26ZOP-006_Dry_Tray22_82.50-86.00m.jpg`
 
 ---
 
+## What changed in 1.7.0
+
+Found by running 1.6.0 over all 28 photos of DD_ZOP_014, where the reader
+filled in 6 tray numbers and 3 depths.
+
+**The label reader was blind on most of that hole, and nothing said so.** On 22
+of the 28 photos it found *no lettering at all* — not a misread, no read. The
+pale cover behind the bar comes through as one or two blobs a thousand pixels
+wide, and the region finder took the four **biggest** blobs as its sample of
+the lettering and measured the baseline off them. The baseline then landed
+between the cover and the text, and every real group failed the band test.
+Size cannot tell a patch of cover from a word, so the finder now looks for what
+lettering actually is: **several blobs of similar height sitting on one
+baseline**. Every blob is tried as the seed of a row and the row with the most
+members wins. Two patches of cover cannot outnumber the five groups of a label.
+
+**It also tries three brightness thresholds instead of one.** The bar is lit
+unevenly — on the UG26ZOP photos the bright right-hand end set a threshold the
+dimmer left end could not reach, so only END DEPTH was ever found and the tray
+number was invisible.
+
+**The tray number is taken from the middle of the bar, not "the second group
+from the left".** How many groups a bar breaks into is not fixed: END, DEPTH
+and the number usually separate, TRAY sometimes splits from its digits, and the
+hole is sometimes clipped off the crop. Counting from the left put "END" in the
+tray column the moment the hole group was missed. Measured across both diamond
+holes the hole sits at 0.13–0.20 of the bar width, the tray at 0.45–0.52 and
+the END DEPTH run at 0.71–0.91.
+
+**A tray number clipped short no longer vetoes the field.** One shallow slice
+reading 5 where seven slices read 35 threw the whole reading away. A reading
+that is a strict *suffix* of a longer one seen at least as often is now dropped
+as a clipped read — a digit can be lost off the front of a group, it cannot be
+invented there. Any other disagreement still vetoes.
+
+Over three sets, with **no value read wrongly anywhere**:
+
+| | tray, before | tray, now | depth, before | depth, now |
+|---|---|---|---|---|
+| DD_ZOP_014 (28) | 6 | **28** | 8 | 26 |
+| DD_ZOP_015 (17) | 16 | **17** | 15 | 15 |
+| UG26ZOP (19) | 6 | **9** | 15 | 15 |
+
+**Tray numbers now carry across the photos that could not be read.** The table
+starts with a guess from the photo order — 1, 1, 2, 2 — and where the reader
+failed that guess stayed on screen in white, looking exactly like a confirmed
+value. On a hole starting at tray 26 it was wrong on every row. The photos are
+in order, so each read is compared with its own position guess and, if every
+read implies the same offset, the offset is applied to the rest. Carried values
+land amber. If the reads do not agree on one offset — a reshoot, a missing
+photo, a misread — nothing is carried and the log says so.
+
+End to end on DD_ZOP_014 the table now fills **28 of 28 tray numbers and 28 of
+28 depths**, all correct, against 6 and 3 before.
+
 ## What changed in 1.6.0
 
 Three things reported from a full 48-photo run of DD_ZOP_015, all of them in

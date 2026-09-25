@@ -447,6 +447,55 @@ def test_depth_markers_in_the_core_are_not_taken_for_the_label_bar():
     assert (box[3] - box[1]) > 0.3 * img.shape[0], (
         f"crop collapsed to {box[3] - box[1]:.0f} px tall")
 
+def test_a_cover_behind_the_bar_does_not_hide_the_lettering():
+    """DD_ZOP_014: 22 of 28 photos read nothing at all.
+
+    The pale cover behind the label bar comes through as one or two blobs a
+    thousand pixels wide. The region finder used to take the four BIGGEST
+    blobs as its sample of the lettering and read the baseline off them, so
+    the baseline landed between the cover and the text and every real group
+    failed the band test. Nothing was read - not a misread, no read - and the
+    filename guess was left on screen looking like a confirmed value.
+
+    The row of blobs that share a baseline AND a height now wins on member
+    count instead, which two patches of cover cannot beat.
+    """
+    strip = _fixture("cover_behind_bar.png")
+    groups = glyphs.text_groups(strip)
+    assert len(groups) >= glyphs.MIN_GROUPS, (
+        f"{len(groups)} group(s) found - the cover is winning again")
+    assert glyphs.read_tray(strip) == 35
+    assert abs(glyphs.read_depth(strip) - 129.10) < 0.005
+
+
+def test_the_tray_number_is_taken_from_the_middle_of_the_bar():
+    """Counting groups from the left put END in the tray column.
+
+    How many groups a bar breaks into is not fixed: END, DEPTH and the number
+    usually separate, TRAY sometimes splits from its digits, and the hole is
+    sometimes clipped off the crop. The layout on the steel does not move, so
+    position decides.
+    """
+    strip = _fixture("cover_behind_bar.png")
+    W = float(strip.shape[1])
+    xs = [(x + g.shape[1] / 2.0) / W for x, g in glyphs.text_groups(strip)]
+    assert any(0.28 <= x <= 0.68 for x in xs), f"no middle group in {xs}"
+    assert glyphs.read_tray(strip) == 35
+    # with nothing to the right of the middle group there is no depth run, so
+    # the middle group cannot be the tray - refuse rather than guess
+    left = strip[:, :int(W * 0.60)]
+    assert glyphs.read_tray(left) is None
+
+
+def test_a_tray_number_clipped_short_does_not_veto_the_whole_field():
+    """One shallow slice reading 5 where seven read 35 lost the field."""
+    assert glyphs._drop_clipped_trays([35, 35, 5]) == [35, 35]
+    assert glyphs._drop_clipped_trays([7, 37, 37, 37]) == [37, 37, 37]
+    # a genuine disagreement is still a veto
+    assert sorted(glyphs._drop_clipped_trays([12, 13])) == [12, 13]
+    # and a suffix seen MORE often than the long reading is not thrown away
+    assert sorted(glyphs._drop_clipped_trays([5, 5, 35])) == [5, 5, 35]
+
 
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

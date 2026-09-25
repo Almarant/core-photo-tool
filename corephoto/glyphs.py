@@ -47,7 +47,7 @@ def available():
 
 
 # ------------------------------------------------------------------ locate
-def _tiles_mask(g):
+def _tiles_mask(g, frac=0.72, floor=140):
     """Bright stencil tiles. Every size here is relative to the strip height:
     absolute pixel sizes silently change behaviour when the caller passes a
     downscaled bar, which is exactly how a half-size strip ended up merging
@@ -55,7 +55,7 @@ def _tiles_mask(g):
     H = g.shape[0]
     sig = max(H * 0.010, 1.0)
     bl = cv2.GaussianBlur(g, (0, 0), sig)
-    m = (bl > max(140, np.percentile(bl, 90) * 0.72)).astype(np.uint8) * 255
+    m = (bl > max(floor, np.percentile(bl, 90) * frac)).astype(np.uint8) * 255
     k = max(int(H * 0.03), 3)
     return cv2.morphologyEx(m, cv2.MORPH_CLOSE,
                             cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
@@ -81,13 +81,38 @@ def text_groups(bar):
         return []
     g = cv2.cvtColor(bar, cv2.COLOR_BGR2GRAY) if bar.ndim == 3 else bar
     H, W = g.shape
+    # Several brightness thresholds, not one. The bar is lit unevenly - on the
+    # UG26ZOP photos the right-hand end is bright enough to set a threshold
+    # that the dimmer left-hand end cannot reach, so the hole and TRAY groups
+    # were never found and only END DEPTH was read. Each threshold is scored
+    # on its own and the best baseline row wins; pooling the blobs instead
+    # would count the same tile several times over.
+    best, ok = (), []
+    for frac, floor in ((0.72, 140), (0.60, 115), (0.50, 95)):
+        cand = _candidates(g, H, W, frac, floor)
+        row = _baseline_row(cand)
+        if not row:
+            continue
+        span = max(b[0] + b[2] for b in row) - min(b[0] for b in row)
+        key = (len(row), span)
+        if key > best:
+            best, ok = key, row
+    if not ok:
+        return []
+    out = []
+    for x, y, w, h, _ in sorted(ok, key=lambda b: b[0]):
+        q = int(0.25 * h)
+        out.append((x, g[max(y - q, 0):min(y + h + q, H),
+                         max(x - q, 0):min(x + w + q, W)]))
+    return out
+
+
+def _candidates(g, H, W, frac, floor):
+    """Blobs in the strip that could be a group of stencil tiles."""
     kw, kh = max(int(0.11 * H), 5), max(int(0.047 * H), 3)
-    big = cv2.morphologyEx(_tiles_mask(g), cv2.MORPH_CLOSE,
+    big = cv2.morphologyEx(_tiles_mask(g, frac, floor), cv2.MORPH_CLOSE,
                            cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh)))
     n, _, st, _ = cv2.connectedComponentsWithStats(big, 8)
-    # Thresholds scale with the strip, so a downscaled bar degrades gracefully
-    # instead of silently matching nothing. (Absolute pixel limits here once made
-    # the app find no digits at all, because it passed a 1/4-size strip.)
     min_h, min_w, min_a = 0.12 * H, 0.20 * H, 0.07 * H * H
     cand = []
     for i in range(1, n):
@@ -97,21 +122,40 @@ def text_groups(bar):
         if a / float(w * h) < 0.5:              # sparse blob = glare, not text
             continue
         cand.append((x, y, w, h, a))
-    if not cand:
-        return []
-    ref = sorted(cand, key=lambda b: -b[4])[:4]
-    yc = np.median([b[1] + b[3] / 2.0 for b in ref])
-    hm = np.median([b[3] for b in ref])
-    ok = [b for b in cand
-          if abs((b[1] + b[3] / 2.0) - yc) < 0.40 * hm and 0.6 * hm < b[3] < 1.5 * hm]
-    if not ok:
-        return []
-    out = []
-    for x, y, w, h, _ in sorted(ok, key=lambda b: b[0]):
-        q = int(0.25 * h)
-        out.append((x, g[max(y - q, 0):min(y + h + q, H),
-                         max(x - q, 0):min(x + w + q, W)]))
-    return out
+    return cand
+
+
+def _baseline_row(cand):
+    """The row of blobs that is actually lettering.
+
+    This used to take the FOUR BIGGEST blobs, assume they were text, and read
+    the baseline off them. On DD_ZOP_014 that failed on 22 of 28 photos: the
+    pale cover behind the bar comes through as one or two blobs a thousand
+    pixels wide, they are the biggest things in the strip by area, and the
+    baseline then lands between the cover and the lettering. Every real group
+    was thrown out by the band test and the reader saw nothing at all - not a
+    misread, no read.
+
+    Size cannot separate them, so use the property the real lettering has and
+    a patch of cover does not: several separate blobs of SIMILAR HEIGHT sitting
+    on ONE baseline. Every blob is tried as the seed of a row, and the row with
+    the most members wins (ties go to the row spanning more of the bar). Two
+    cover patches can share an edge, but they cannot outnumber the five groups
+    of a label, so the correct row wins on the count.
+    """
+    best = None
+    for c in cand:
+        yc, h = c[1] + c[3] / 2.0, float(c[3])
+        row = [b for b in cand
+               if abs((b[1] + b[3] / 2.0) - yc) < 0.40 * h
+               and 0.6 * h < b[3] < 1.5 * h]
+        if len(row) < 2:
+            continue
+        span = max(b[0] + b[2] for b in row) - min(b[0] for b in row)
+        key = (len(row), span)
+        if best is None or key > best[0]:
+            best = (key, row)
+    return best[1] if best else []
 
 
 def depth_region(bar):
@@ -270,11 +314,35 @@ def read_hole_digits(bar, count=3):
 
 
 def read_tray(bar):
-    """The tray number off the middle group, or None."""
+    """The tray number, taken from the group in the MIDDLE OF THE BAR.
+
+    Not "the second group from the left". The bar reads
+    `<hole>   TRAY<n>   END DEPTH <d>`, but how many groups that comes out as
+    is not fixed: END and DEPTH and the number usually separate, the hole is
+    sometimes clipped off the end of the crop, and TRAY and its number
+    sometimes split in two. Counting from the left put "END" in the tray
+    column the moment the hole group was missed.
+
+    The physical layout does not move. Measured across DD_ZOP_014 and 015 the
+    hole sits at 0.13-0.20 of the bar width, the tray at 0.45-0.52 and the
+    END DEPTH run at 0.71-0.91, so the group nearest the middle is the tray
+    and there must still be something to the right of it. Where TRAY and its
+    number split, the nearest-the-middle rule also picks the digits rather
+    than the word.
+    """
     gr = text_groups(bar)
     if len(gr) < MIN_GROUPS:
         return None          # need hole | tray | depth to know which is which
-    runs = split_on_gap(characters(gr[1][1], keep_x=True))
+    W = float(bar.shape[1])
+    mid = [(abs((x + g.shape[1] / 2.0) / W - 0.50), x, g) for x, g in gr
+           if 0.28 <= (x + g.shape[1] / 2.0) / W <= 0.68]
+    if not mid:
+        return None
+    mid.sort(key=lambda t: t[0])
+    _, tx, tg = mid[0]
+    if not any(x > tx + tg.shape[1] for x, _ in gr):
+        return None          # nothing to its right, so that was not the tray
+    runs = split_on_gap(characters(tg, keep_x=True))
     d = read_tail_digits([g for _, g in runs[-1]], 2)
     if not d:
         return None
@@ -311,8 +379,36 @@ def read_label(bars):
                 v = None
             if v is not None:
                 seen.append(v)
+        if field == "tray":
+            seen = _drop_clipped_trays(seen)
         out[field] = seen[0] if (seen and len(set(seen)) == 1) else None
     return out
+
+
+def _drop_clipped_trays(seen):
+    """Throw away a tray number that is the tail of a longer one.
+
+    A shallow slice can cut the leading digit off the tray number, so the same
+    label reads 35 from seven slices and 5 from one. Unanimity then rejects the
+    field and a correctly-read tray number is lost - that cost 3 of 28 photos
+    on DD_ZOP_014.
+
+    Only a STRICT SUFFIX is dropped, and only when the longer reading was seen
+    at least as often. A digit can be lost off the front of a group; one cannot
+    be invented there, so the longer reading is the one to keep. Anything else
+    that disagrees still vetoes the field.
+    """
+    if len(set(seen)) < 2:
+        return seen
+    n = {v: seen.count(v) for v in set(seen)}
+    keep = []
+    for v in seen:
+        sv = str(v)
+        if any(sw != sv and sw.endswith(sv) and n[w] >= n[v]
+               for w in n for sw in (str(w),)):
+            continue
+        keep.append(v)
+    return keep or seen
 
 
 def read_depth(bar):

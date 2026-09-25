@@ -711,7 +711,8 @@ class App(_Root):
         The hole name is never touched: the reader does not read hole numbers
         (see ocr.read_label for why), and the folder name is a better guess.
         """
-        filled_t = filled_d = 0
+        filled_t = filled_d = carried = 0
+        out_of_step = []
         for fs in self.folders.values():
             for r in fs.rows:
                 t = (reads.get(r["src"]) or {}).get("tray")
@@ -719,6 +720,11 @@ class App(_Root):
                     r["tray"].set(str(t))
                     r["tray_confirmed"] = False
                     filled_t += 1
+            n = self._carry_trays(fs, reads)
+            if n < 0:
+                out_of_step.append(fs.rel)
+            else:
+                carried += n
             trays = {}
             for r in fs.rows:
                 try:
@@ -747,10 +753,55 @@ class App(_Root):
                     filled_d += 1
         for fs in self.folders.values():
             self._seed_start(fs)
+        if carried:
+            self.say(f"  carried those tray numbers across to {carried} photo(s) "
+                     f"the reader could not read (amber = please check)")
+        for rel in out_of_step:
+            self.say(f"  ! the tray numbers read in {os.path.basename(rel)} do not "
+                     f"run in step with the photo order - nothing was carried "
+                     f"across, check the tray column by hand")
         total = sum(len(fs.rows) for fs in self.folders.values())
         self.say(f"  read {filled_d} of {total} depths and {filled_t} tray numbers "
                  f"off the label bars (amber = unchecked, please look them over)")
         logfile.write(f"reads: depths {filled_d}/{total}, trays {filled_t}/{total}")
+
+    @staticmethod
+    def _carry_trays(fs, reads):
+        """Give the unread photos the tray number their position implies.
+
+        The table starts with a guess from the photo order - 1, 1, 2, 2, 3, 3.
+        Where the reader failed, that guess stayed on screen in white, looking
+        exactly like a confirmed value, and on a hole that starts at tray 26 it
+        is wrong on every row. DD_ZOP_014 read 6 of 28 and the other 22 had to
+        be retyped.
+
+        The photos ARE in order, so one read tray number fixes all of them. Each
+        read is compared with its own position guess; if every read implies the
+        SAME offset, the offset is applied to the rest. If they do not agree -
+        a reshoot, a missing photo, a misread - nothing is carried across and
+        the caller says so. Carried values land amber, like anything else the
+        human has not looked at.
+
+        Returns how many rows were filled, or -1 when the reads disagree.
+        """
+        read_t = {r["src"]: (reads.get(r["src"]) or {}).get("tray")
+                  for r in fs.rows}
+        if sum(1 for v in read_t.values() if v is not None) < 2:
+            return 0                      # one read is not a pattern
+        guess = naming.suggest_trays(fs.photos)
+        offs = {v - guess[src] for src, v in read_t.items()
+                if v is not None and src in guess}
+        if len(offs) != 1:
+            return -1
+        off = offs.pop()
+        n = 0
+        for r in fs.rows:
+            if read_t.get(r["src"]) is not None or r["src"] not in guess:
+                continue
+            r["tray"].set(str(guess[r["src"]] + off))
+            r["tray_confirmed"] = False
+            n += 1
+        return n
 
     # ------------------------------------------------------------- preview
     def _step(self, k):

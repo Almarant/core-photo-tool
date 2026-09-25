@@ -157,6 +157,51 @@ def test_tray_one_starts_at_zero_without_being_typed():
         a.destroy()
 
 
+def test_read_tray_numbers_are_carried_across_the_unread_photos():
+    """DD_ZOP_014 read 6 tray numbers of 28.
+
+    The other 22 rows kept the guess taken from the photo order - 1, 1, 2, 2 -
+    on a hole that starts at tray 26, in white, looking exactly like a value
+    somebody had checked. Every one had to be retyped. The photos are in
+    order, so any two agreeing reads fix the whole column.
+    """
+    if SKIP:
+        return
+    a = _win()
+    try:
+        photos = _fake_scan(a)
+        reads = {photos[0]: {"tray": 26, "depth": None},
+                 photos[2]: {"tray": 27, "depth": None}}
+        a._apply_reads(reads)
+        fs = a._cur()
+        assert [r["tray"].get() for r in fs.rows] == ["26", "26", "27", "27"]
+        # the carried ones are flagged as unchecked, the read ones too
+        assert not any(r.get("tray_confirmed", True) for r in fs.rows)
+    finally:
+        a.destroy()
+
+
+def test_tray_numbers_that_disagree_are_not_carried_anywhere():
+    """A reshoot or a misread breaks the one-offset assumption. Then nothing
+    is carried and the log says so - a wrong number spread over a whole hole
+    is worse than a guess left where it was."""
+    if SKIP:
+        return
+    a = _win()
+    try:
+        photos = _fake_scan(a)
+        fs_before = [r["tray"].get() for r in a._cur().rows]
+        reads = {photos[0]: {"tray": 26, "depth": None},
+                 photos[2]: {"tray": 40, "depth": None}}      # not in step
+        a._apply_reads(reads)
+        rows = a._cur().rows
+        assert rows[0]["tray"].get() == "26" and rows[2]["tray"].get() == "40"
+        assert rows[1]["tray"].get() == fs_before[1]
+        assert rows[3]["tray"].get() == fs_before[3]
+    finally:
+        a.destroy()
+
+
 def main():
     if SKIP:
         print(f"  skipped: {SKIP}")
