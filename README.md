@@ -1,5 +1,15 @@
 # Core Photo Tool
 
+[![Download](https://img.shields.io/badge/Download-CorePhotoTool.exe-2ea44f?style=for-the-badge&logo=windows)](https://github.com/Almarant/core-photo-tool/releases/latest/download/CorePhotoTool.exe)
+[![Release](https://img.shields.io/github/v/release/Almarant/core-photo-tool?style=flat-square)](https://github.com/Almarant/core-photo-tool/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Almarant/core-photo-tool/total?style=flat-square)](https://github.com/Almarant/core-photo-tool/releases)
+
+### ⬇️ [Download CorePhotoTool.exe](https://github.com/Almarant/core-photo-tool/releases/latest/download/CorePhotoTool.exe) — Windows, 71 MB, nothing to install
+
+> Windows will warn you it's from an unknown publisher (the app isn't code-signed).
+> Click **More info → Run anyway**. First launch takes 5–15 seconds while it unpacks —
+> it looks frozen, it isn't.
+
 Crops, straightens, colour-corrects, sorts dry/wet and renames drill-core tray
 photographs. Point it at a folder, check one preview, type the tray depths, press
 go.
@@ -294,8 +304,7 @@ touched.
 
 ## For geologists — just use it
 
-1. Download **CorePhotoTool.exe** from the
-   [Releases page](../../releases) and double-click it. Nothing to install.
+1. Download the .exe using the button above and double-click it.
 2. **Step 1 – Photos.** Add what you want to process: **drag folders or
    individual photos onto the list**, or use **Add folder…** / **Add files…**.
    Mix both freely — a whole hole plus one stray reshoot is fine, and processing
