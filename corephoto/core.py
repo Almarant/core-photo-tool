@@ -63,6 +63,39 @@ class Params:
 PAD_COLOR = (105, 105, 105)   # honest fill where the tray ran past the frame edge
 
 
+# --------------------------------------------------------------- loading
+_ORIENT = {}
+
+
+def _orientation_flag(path):
+    """IMREAD_IGNORE_ORIENTATION when the camera's rotation tag is wrong.
+
+    The camera points straight down at the tray, and its orientation sensor
+    cannot tell which way round it is held from straight above. DD26ZOP-027
+    IMG_1726 came out tagged "rotate 90" on perfectly ordinary landscape
+    pixels; OpenCV obeys the tag, the tray arrives standing on end, and the
+    crop and the label reading both fail outright.
+
+    A tray photo is always landscape. So the tag is obeyed only when it leaves
+    the image landscape; when it would turn landscape pixels into a portrait
+    image it is ignored. Decided once per file, at 1/8 scale.
+    """
+    if path not in _ORIENT:
+        flag = 0
+        a = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_8)
+        if a is not None and a.shape[0] > a.shape[1]:
+            b = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_8 | cv2.IMREAD_IGNORE_ORIENTATION)
+            if b is not None and b.shape[1] > b.shape[0]:
+                flag = cv2.IMREAD_IGNORE_ORIENTATION
+        _ORIENT[path] = flag
+    return _ORIENT[path]
+
+
+def imread(path, flag=cv2.IMREAD_COLOR):
+    """cv2.imread with the orientation rule above. Every photo goes through it."""
+    return cv2.imread(path, flag | _orientation_flag(path))
+
+
 # --------------------------------------------------------------- detection
 def tray_mask(small):
     b = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[:, :, 2], (7, 7), 0)
@@ -238,6 +271,96 @@ def _hypothesis(s, m, p: Params):
                 shape_err=abs(aspect - p.tray_aspect))
 
 
+BENCH_L = 165       # L* (0-255) above which a column/row counts as pale bench cover
+
+
+def _first_run(arr, cond, start, step, n):
+    """Index of the first of `n` consecutive entries satisfying `cond`,
+    walking from `start` in direction `step`; None if there is none."""
+    i = start
+    while 0 <= i < len(arr):
+        if all(0 <= i + k * step < len(arr) and cond(arr[i + k * step]) for k in range(n)):
+            return i
+        i += step
+    return None
+
+
+def fit_tray(s, bb, bar):
+    """This photo's own tray edges, where the tray sits on a pale cover.
+
+    The crop used one width for the whole batch - the median of the detected
+    widths - centred on each photo's tray. That assumes the camera height never
+    changes. On DD26ZOP-026 it did: the tray measured 651-735 px across the
+    batch (12% spread), so every crop was either loose, showing floor and the
+    cover at the sides and bottom, or tight. The tray finder's own box was no
+    substitute, out by a median 6 px and up to 62 px per edge on that hole.
+
+    On a pale cover the edges can be found directly: walk out from the middle
+    of the tray along the rows below the bar until the cover starts, and down
+    until it starts again under the bottom rail. Returns (x0, x1, y1) in the
+    deskewed 1/8-scale frame, or None when no pale cover is found on BOTH sides
+    (a side may instead run off the frame) - on those rigs (teal trays on
+    concrete, DD_ZOP_014/015) the batch-width crop is kept, as before.
+    """
+    H, W = s.shape[:2]
+    w0 = max(bb[2] - bb[0], 1)
+    ya, yb = int(bar + 0.035 * w0), int(min(H - 1, bar + 0.28 * w0))
+    if yb - ya < 20:
+        return None
+    L = cv2.GaussianBlur(cv2.cvtColor(s, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32),
+                         (3, 3), 0)
+    col = np.median(L[ya:yb], axis=0)
+    xc = int(0.5 * (bb[0] + bb[2]))
+    bright = lambda v: v > BENCH_L
+    r = _first_run(col, bright, xc, +1, 6)
+    lft = _first_run(col, bright, xc, -1, 6)
+    x1 = r - 1 if r is not None else W - 1
+    x0 = lft + 1 if lft is not None else 0
+    # A side that found no cover must genuinely run off the frame.
+    if (r is None and bb[2] < W - 3) or (lft is None and bb[0] > 2):
+        return None
+    if r is None and lft is None:
+        return None
+    if not 0.85 <= (x1 - x0) / w0 <= 1.15:
+        return None
+    rows = np.median(L[:, x0 + 15:x1 - 15], axis=1)
+    b = _first_run(rows, lambda v: v > BENCH_L - 5, int(bar + 0.25 * (x1 - x0)), +1, 8)
+    y1 = b - 1 if b is not None else H - 1
+    return (int(x0), int(x1), int(y1))
+
+
+def settle_fits(dets, tol=0.10):
+    """Batch rule for the per-photo fits. Returns the tray shape to lock to.
+
+    A fit whose shape (width / height from the bar down to the bottom rail) is
+    off the batch median by more than `tol` has caught something that is not
+    the tray - a paintbrush beside it (026 IMG_1674) or a rail it stopped short
+    of (IMG_1684) - and is dropped; that photo keeps the old batch-width box
+    and its shape warning. The lock uses the TALLEST good shape, so no photo
+    loses its bottom rail; the others take in a sliver of cover below it.
+    Returns None when the batch is not a pale-cover rig (see below).
+    """
+    shapes = {k: (d["fit"][1] - d["fit"][0]) / max(d["fit"][2] - d["bar"], 1)
+              for k, d in dets.items() if d.get("fit")}
+    # A rig with a pale cover fits on most photos (42-48 of 44-56 on DD26ZOP
+    # 021/026/027); a teal tray on concrete fits only by accident (2 of 28 on
+    # DD_ZOP_014, 10 of 48 on 015). Mixing the two in one batch would put the
+    # accidental shape on every photo, so below half the batch none is used.
+    if len(shapes) < max(3, 0.5 * len(dets)):
+        for d in dets.values():
+            d.pop("fit", None)
+        return None
+    med = float(np.median(list(shapes.values())))
+    good = []
+    for k, a in shapes.items():
+        if abs(a - med) > tol:
+            dets[k].pop("fit", None)
+        else:
+            good.append(a)
+            dets[k]["aspect_ok"] = True     # the box is this photo's own tray
+    return min(good) if good else None
+
+
 def detect_image(s, p: Params = None):
     """Detection on an already-decoded 1/8-scale frame.
 
@@ -283,17 +406,18 @@ def detect_image(s, p: Params = None):
     if method != "tiles" and pre_method == "tiles":
         bt, bbot, method, strength = pre_y, pre_bot, pre_method, pre_strength
     x0, y0, x1, y1 = bb
+    fit = fit_tray(s, bb, bt) if method in ("tiles", "gradient") else None
     return dict(small=s, bb=bb, angle=ang, bar=bt, bar_bot=bbot,
                 bar_strength=strength, bar_method=method, tray_px=int(x1 - x0),
                 mask_method=mask_method, tray_aspect=round(best["aspect"], 2),
-                aspect_ok=bool(aspect_ok),
+                aspect_ok=bool(aspect_ok), fit=fit,
                 cut_left=int(x0 <= 2), cut_right=int(x1 >= s.shape[1] - 3))
 
 
 def detect(path, p: Params = None):
     """Returns dict(small, bb, angle, bar, bar_method, bar_strength,
     tray_px, cut_left, cut_right) or None."""
-    return detect_image(cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_8), p)
+    return detect_image(imread(path, cv2.IMREAD_REDUCED_COLOR_8), p)
 
 
 def manual_detect(path):
@@ -303,7 +427,7 @@ def manual_detect(path):
     and never seen again. Here it gets a default box covering most of the frame
     so the corner handles can be dragged onto the tray by hand.
     """
-    s = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_8)
+    s = imread(path, cv2.IMREAD_REDUCED_COLOR_8)
     if s is None:
         return None
     h, w = s.shape[:2]
@@ -315,15 +439,36 @@ def manual_detect(path):
 
 
 def crop_box(d, p: Params):
-    """Auto-detected crop rectangle, in detection-pixel coordinates."""
+    """Auto-detected crop rectangle, in detection-pixel coordinates.
+
+    With a per-photo fit (`fit_tray`) the box spans this photo's own tray;
+    otherwise the batch width is centred on the detected tray, as before.
+    """
     x0, y0, x1, y1 = d["bb"]
-    xc = 0.5 * (x0 + x1)
-    left = xc - p.tray_width / 2 - p.pad_x
-    right = xc + p.tray_width / 2 + p.pad_x
+    if d.get("fit"):
+        left, right, y1 = d["fit"][0] - p.pad_x, d["fit"][1] + p.pad_x, d["fit"][2]
+    else:
+        xc = 0.5 * (x0 + x1)
+        left = xc - p.tray_width / 2 - p.pad_x
+        right = xc + p.tray_width / 2 + p.pad_x
     top = d["bar"] - p.pad_top
     if p.lock_aspect and p.tray_aspect > 0:
         return (left, top, right, top + (right - left) / p.tray_aspect)
     return (left, top, right, y1 + p.pad_bottom)
+
+
+def _scale(d, p: Params, prof=None):
+    """Output pixels per detection pixel for this photo.
+
+    A fitted photo is scaled so ITS tray fills the canvas width: the tray is
+    the same physical object in every shot, so that is what keeps
+    millimetres-per-pixel constant when the camera height changes. Everything
+    else uses the batch scale, as before.
+    """
+    if prof is None and d.get("fit"):
+        l, _, r, _ = crop_box(d, p)
+        return OUT_WIDTH / (max(r - l, 1) * RED)
+    return p.scale
 
 
 def profile_from_quad(d, p: Params, adj=None):
@@ -394,8 +539,9 @@ def out_size(d, p: Params, adj=None, prof=None):
     q = crop_quad(d, p, adj, prof)
     w = 0.5 * (np.hypot(*(q[1] - q[0])) + np.hypot(*(q[2] - q[3])))
     h = 0.5 * (np.hypot(*(q[3] - q[0])) + np.hypot(*(q[2] - q[1])))
-    return (max(int(round(w * RED * p.scale)), 1),
-            max(int(round(h * RED * p.scale)), 1))
+    k = _scale(d, p, prof)
+    return (max(int(round(w * RED * k)), 1),
+            max(int(round(h * RED * k)), 1))
 
 
 # ----------------------------------------------------------- normalisation
@@ -423,19 +569,58 @@ def normalise(im, target_L=200.0):
 
 def core_stats(crop):
     """Median L* / chroma of the ROCK only. The mask excludes teal tray plastic
-    and white tape; without it a near-empty tray is dominated by plastic and the
-    dry/wet comparison collapses."""
+    (a* below -3); without it a near-empty tray is dominated by plastic and the
+    dry/wet comparison collapses.
+
+    It used to require warm rock as well (b* above -4). Core that photographs
+    cool - the blue-grey to purple limestone of DD26ZOP-021 to -027 - then lost
+    most of its pixels to the mask, and the "rock" median was taken over the
+    rusty label bar and tape markings instead: the same 113.0 came back on six
+    different photos. Measured on 114 trays from five holes, that mask got 28
+    dry/wet calls wrong; a* alone gets 4. Only used now for trays with more
+    or fewer than two photos - pairs are compared with `pair_score`."""
     h, w = crop.shape[:2]
     roi = crop[int(0.16 * h):int(0.97 * h), int(0.04 * w):int(0.96 * w)]
     roi = cv2.resize(roi, (max(roi.shape[1] // 4, 1), max(roi.shape[0] // 4, 1)),
                      interpolation=cv2.INTER_AREA)
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, a, b = lab[:, :, 0], lab[:, :, 1] - 128, lab[:, :, 2] - 128
-    rock = (a > -3) & (b > -4) & (L > 15) & (L < 225)
+    rock = (a > -3) & (L > 15) & (L < 225)
     fill = float(rock.mean())
     if rock.sum() < 0.02 * L.size:
         rock = (L > 15) & (L < 225)
     return (float(np.median(L[rock])), float(np.median(np.sqrt(a * a + b * b)[rock])), fill)
+
+
+PAIR_W = 160      # width of the brightness map two shots are compared on
+
+
+def pair_map(crop):
+    """Small, blurred L* map of the tray below the label bar, for `pair_score`."""
+    h, w = crop.shape[:2]
+    roi = crop[int(0.16 * h):int(0.97 * h), int(0.04 * w):int(0.96 * w)]
+    roi = cv2.resize(roi, (PAIR_W, max(int(PAIR_W * roi.shape[0] / max(roi.shape[1], 1)), 1)),
+                     interpolation=cv2.INTER_AREA)
+    L = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+    return cv2.GaussianBlur(L, (5, 5), 0)
+
+
+def pair_score(a, b):
+    """How much brighter shot `a` is than shot `b`, place by place.
+
+    The two shots are the same tray in nearly the same framing, so instead of
+    comparing one median brightness with another - which is what a single
+    bright depth block or a strip of tray plastic can tip - each place in the
+    tray is compared with itself, and the median of those differences is
+    taken. Positive means `a` is the dry shot. Measured on 114 trays: 112
+    right, against 110 for the best whole-photo median.
+    """
+    n = min(a.shape[0], b.shape[0])
+    a, b = a[:n], b[:n]
+    ok = (a > 6) & (b > 6) & (a < 250) & (b < 250)
+    if ok.sum() < 50:
+        return 0.0
+    return float(np.median((a - b)[ok]))
 
 
 _REDUCED_FLAG = {1: cv2.IMREAD_COLOR,
@@ -459,7 +644,7 @@ def render(path, d, p: Params, adj=None, reduce=1, prof=None):
     OW, OH = max(OW // reduce, 1), max(OH // reduce, 1)
     quad = crop_quad(d, p, adj, prof) * (RED / float(reduce))
     dst = np.array([[0, 0], [OW, 0], [OW, OH], [0, OH]], np.float32)
-    full = cv2.imread(path, _REDUCED_FLAG[reduce])
+    full = imread(path, _REDUCED_FLAG[reduce])
     if full is None:
         raise IOError("could not read " + path)
     fh, fw = full.shape[:2]

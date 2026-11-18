@@ -43,12 +43,8 @@ APP_TITLE = f"Core Photo Tool {__version__}"
 # then the run rendered them all again. Saving is always full resolution.
 SCAN_REDUCE = 2
 
-# Above this L* gap between a tray's two shots, the dry/wet call is taken as
-# settled; below it the pair is listed for a human to look at. 12 was read off
-# the DD26ZOP set, where the core is pale and the wet/dry contrast is large. On
-# the darker UG26ZOP core, pairs that are obvious to the eye separate by 4-6,
-# so 12 flags most of the batch and the list stops meaning anything.
-DRY_WET_MARGIN = 6.0
+# Dry/wet is decided per hole in naming.decide_hole; its thresholds
+# (STRONG_PAIR, DRY_WET_MARGIN) and the reasoning behind them live there.
 UNCONFIRMED_BG = "#fff3cd"      # amber: filled by OCR, not yet checked by a human
 CONFIRMED_BG = "#ffffff"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -410,7 +406,7 @@ class App(_Root):
         self._col(hdr, "Label bar", THUMB_COL)
         self._col(hdr, "Tray", 74)
         self._col(hdr, "End depth (m)", 124)
-        self._col(hdr, "Dry / Wet", 104)
+        self._col(hdr, "Dry / Wet", 190)
         self._col(hdr, "File", 200)
 
         wrap = ttk.Frame(f); wrap.pack(fill="both", expand=True, padx=14, pady=(4, 8))
@@ -580,6 +576,7 @@ class App(_Root):
                 det[p] = d
                 crop, _ = core.render(p, d, self.params, reduce=SCAN_REDUCE)
                 coreL[p] = core.core_stats(crop)[0]
+                d["pairmap"] = core.pair_map(crop)
                 if do_ocr:
                     reads[p] = ocr.read_label(
                         core.label_strips(crop, d, self.params))
@@ -625,7 +622,14 @@ class App(_Root):
         # set at aspects 2.15, 2.55 and 4.09. With it locked every photo in a
         # batch comes out on an identical canvas.
         good = [d["tray_aspect"] for d in det.values() if d.get("aspect_ok")]
-        if len(good) >= 3:
+        fitted = core.settle_fits({p: d for p, d in det.items() if p not in self.recovered})
+        nfit = sum(1 for d in det.values() if d.get("fit"))
+        if fitted:
+            self.params.tray_aspect = fitted
+            self.say(f"Tray edges found on each photo's own tray in {nfit} of "
+                     f"{len(det)} photos (pale cover); crops follow each tray, at "
+                     f"one shape ({fitted:.2f}) and one scale for the batch.")
+        elif len(good) >= 3:
             self.params.tray_aspect = float(np.median(good))
             self.say(f"Tray shape measured at {self.params.tray_aspect:.2f} "
                      f"(width ÷ height) from {len(good)} photos; every crop in "
@@ -1000,6 +1004,7 @@ class App(_Root):
         fs = self._cur()
         if not fs:
             return
+        pred, _ = self._predicted(fs)
         for i, r in enumerate(fs.rows):
             row = ttk.Frame(self.rowsf, padding=(4, 3))
             row.grid(row=i, column=0, sticky="w")
@@ -1031,10 +1036,17 @@ class App(_Root):
             r["entry"] = e
             e.bind("<FocusIn>", lambda ev, rr=r: self._confirm(rr))
             e.bind("<Key>", lambda ev, rr=r: self._confirm(rr))
-            b3 = tk.Frame(row, width=104, height=ROW_H)
+            b3 = tk.Frame(row, width=190, height=ROW_H)
             b3.pack(side="left"); b3.pack_propagate(False)
             ttk.Combobox(b3, textvariable=r["cond"], width=7, state="readonly",
-                         values=("Auto", "Dry", "Wet")).pack(expand=True)
+                         values=("Auto", "Dry", "Wet")).pack(side="left", padx=(6, 4))
+            # What "Auto" will actually do, so a wrong call is visible BEFORE
+            # saving. Amber when it is a close call or against the hole's habit.
+            if r["src"] in pred:
+                c, conf = pred[r["src"]]
+                tk.Label(b3, text=f"auto: {c}" + ("  ?" if conf != "high" else ""),
+                         bg=UNCONFIRMED_BG if conf != "high" else CONFIRMED_BG,
+                         width=10, anchor="w").pack(side="left")
             ttk.Label(row, text=os.path.basename(r["src"]),
                       style="Hint.TLabel").pack(side="left", padx=4, expand=True)
         self._bind_wheel(self.rowsf)
@@ -1061,6 +1073,31 @@ class App(_Root):
                 r["tray_entry"].configure(bg=CONFIRMED_BG)
             except tk.TclError:
                 pass
+
+    def _dry_wet(self, groups, overrides):
+        """naming.decide_hole on this scan's measurements."""
+        scores = {}
+        for t, srcs in groups.items():
+            if len(srcs) == 2:
+                a, b = sorted(srcs)
+                ma = self.det.get(a, {}).get("pairmap")
+                mb = self.det.get(b, {}).get("pairmap")
+                if ma is not None and mb is not None:
+                    scores[t] = core.pair_score(ma, mb)
+        return naming.decide_hole(groups, scores, self.core_L, overrides)
+
+    def _predicted(self, fs):
+        """{source: (condition, confidence)} for the step-3 table, from the
+        tray numbers as they stand. Never raises - it is only a display."""
+        try:
+            _, groups, _, _, _, _ = self._collect(fs)
+            conds, info = self._dry_wet(groups, {})
+            tray = {s: t for t, ss in groups.items() for s in ss}
+            return ({s: (c, info[tray[s]]["confidence"]) for s, c in conds.items()},
+                    info)
+        except Exception:
+            logfile.exception("predicting dry/wet")
+            return {}, {}
 
     # ----------------------------------------------------------- collecting
     def _collect(self, fs):
@@ -1176,6 +1213,7 @@ class App(_Root):
             chained = naming.chain_depths(sorted(groups), ends,
                                           first if first is not None else 0.0)
             manifest = []
+            conds_all, dw = self._dry_wet(groups, overrides)
             for tray in sorted(groups):
                 srcs = groups[tray]
                 start, end = chained[tray]
@@ -1188,7 +1226,8 @@ class App(_Root):
                     logfile.write(f"  SKIPPED {hole} tray {tray}: "
                                   f"start={start} end={end}")
                     continue
-                conds, margin = naming.decide_conditions(srcs, self.core_L, overrides)
+                conds = {s: conds_all[s] for s in srcs}
+                info = dw[tray]
                 names = naming.disambiguate(
                     [naming.make_name(hole, conds[s], tray, start, end) for s in srcs])
                 for s, name in zip(srcs, names):
@@ -1207,9 +1246,10 @@ class App(_Root):
                         from_m=f"{start:.2f}", to_m=f"{end:.2f}",
                         interval_m=round(end - start, 2), condition=conds[s],
                         overridden=int(s in overrides),
-                        dry_wet_margin_L=round(margin, 1),
-                        confidence=("high" if margin >= DRY_WET_MARGIN or s in overrides
-                                    else "check"),
+                        dry_wet_margin_L=(round(info["score"], 1)
+                                          if info["score"] is not None else ""),
+                        confidence=info["confidence"],
+                        dry_wet_basis=info["basis"],
                         core_L=round(self.core_L.get(s, 0), 1),
                         tilt_deg=round(d["angle"], 2),
                         bar_method=d.get("bar_method", ""),

@@ -507,3 +507,84 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ------------------------------------------------------------------ 1.7.1
+# Each of these fails on 1.7.0 (checked by running them against it).
+
+def test_cool_toned_core_is_still_measured_as_rock():
+    """DD26ZOP-021 tray 22. The core photographs blue-grey, and the old rock
+    mask required warm pixels, so it measured the label bar instead and called
+    this tray the wrong way round (113 against 165, with the dark shot as
+    "dry"). The dry shot must come out brighter."""
+    dry = core.core_stats(_fixture("cool_core_dry.jpg"))[0]
+    wet = core.core_stats(_fixture("cool_core_wet.jpg"))[0]
+    assert dry > wet + 20, (dry, wet)
+
+
+def test_pair_score_says_which_shot_is_dry():
+    a = core.pair_map(_fixture("cool_core_dry.jpg"))
+    b = core.pair_map(_fixture("cool_core_wet.jpg"))
+    assert core.pair_score(a, b) > naming.STRONG_PAIR
+    assert core.pair_score(b, a) < -naming.STRONG_PAIR
+
+
+def test_a_wrong_rotation_tag_does_not_stand_the_tray_on_end():
+    """DD26ZOP-027 IMG_1726: landscape pixels tagged "rotate 90". 1.7.0
+    obeyed the tag, got a portrait frame, and found no label bar."""
+    path = os.path.join(FIXTURES, "bad_rotation_tag.jpg")   # already 1/8 scale
+    s = core.imread(path) if hasattr(core, "imread") else cv2.imread(path)
+    assert s.shape[1] > s.shape[0], s.shape
+    d = core.detect_image(s)
+    assert d is not None and d["bar_method"] == "tiles", d and d["bar_method"]
+
+
+def test_the_crop_follows_this_photos_own_tray():
+    """DD26ZOP-026 IMG_1668, a pale-cover rig where the camera height varied
+    by 12% across the hole. The batch-width crop could not follow it; the box
+    must match the tray edges checked by eye (x 52-725 at 1/8 scale) to
+    within 1% of its width."""
+    d = core.detect_image(_fixture("pale_cover_tray.jpg"))
+    p = core.Params()
+    l, t, r, b = core.crop_box(d, p)
+    want_l, want_r = 52 - p.pad_x, 725 + p.pad_x
+    tol = 0.01 * (want_r - want_l)
+    assert abs(l - want_l) <= tol and abs(r - want_r) <= tol, (l, r)
+
+
+def test_a_close_call_follows_the_holes_shooting_order_and_is_flagged():
+    """DD26ZOP-021 trays 10-12: pale limestone, the two shots nearly equal.
+    The hole was shot dry-first everywhere else, so a near-tie goes that way -
+    and is marked for checking, never "high"."""
+    groups = {t: [f"{t}a", f"{t}b"] for t in range(1, 9)}
+    scores = {t: 30.0 for t in range(1, 8)}
+    scores[8] = -2.0                   # too close to call, leaning the wrong way
+    conds, info = naming.decide_hole(groups, scores, {})
+    assert conds["8a"] == "Dry" and conds["8b"] == "Wet"
+    assert info[8]["confidence"] == "check"
+    assert all(info[t]["confidence"] == "high" for t in range(1, 8))
+
+
+def test_a_clear_call_against_the_shooting_order_is_kept_but_flagged():
+    """Crews do sometimes shoot wet first (DD26ZOP-006 tray 25). A clear
+    brightness difference wins over the habit, but is not marked "high"."""
+    groups = {t: [f"{t}a", f"{t}b"] for t in range(1, 9)}
+    scores = {t: 30.0 for t in range(1, 8)}
+    scores[8] = -25.0
+    conds, info = naming.decide_hole(groups, scores, {})
+    assert conds["8a"] == "Wet"
+    assert info[8]["confidence"] == "check"
+
+
+def test_setting_one_shot_by_hand_sets_its_partner():
+    groups = {1: ["a", "b"]}
+    conds, info = naming.decide_hole(groups, {1: 30.0}, {}, {"a": "Wet"})
+    assert conds == {"a": "Wet", "b": "Dry"} and info[1]["basis"] == "set by hand"
+
+
+def test_fits_are_dropped_on_a_rig_without_a_pale_cover():
+    """DD_ZOP_014: teal trays on concrete. The fit landed on 2 of 28 photos by
+    accident; applying their shape to the batch would crop every photo wrong."""
+    dets = {i: dict(bar=100, fit=None) for i in range(10)}
+    dets[0]["fit"] = (10, 700, 360)
+    assert core.settle_fits(dets) is None and dets[0].get("fit") is None

@@ -33,11 +33,11 @@ def group_by_tray(tray_of):
 
 
 def decide_conditions(sources, core_L, overrides=None):
-    """Assign Dry/Wet within one tray. The darker core is wet.
+    """Assign Dry/Wet within one tray by whole-photo brightness: darker is wet.
 
-    Shooting order is NOT used - photographers sometimes shoot wet first
-    (DD26ZOP-006 tray 25 did). With more than two photos, the darkest is wet and
-    the rest are dry; with one, it is dry unless overridden.
+    Used by `decide_hole` for trays that do not have exactly two photos. With
+    more than two, the darkest is wet and the rest are dry; with one, it is
+    dry unless overridden.
 
     overrides: {source: "Dry"|"Wet"} set by the user, always wins.
     Returns ({source: condition}, margin_L).
@@ -53,6 +53,85 @@ def decide_conditions(sources, core_L, overrides=None):
     for s in srcs:
         out[s] = overrides.get(s) or ("Wet" if s == wet else "Dry")
     return out, margin
+
+
+STRONG_PAIR = 8.0   # a pair_score this far from zero decides a tray on its own
+DRY_WET_MARGIN = 6.0
+
+
+def shooting_order(scores):
+    """+1 if this hole was shot dry-first, -1 if wet-first, 0 if no clear habit.
+
+    Measured only on trays whose two shots differ clearly, and only called a
+    habit when three in four of those agree. Every one of 114 trays across
+    DD_ZOP_014/015 and DD26ZOP-021/026/027 was shot dry first.
+    """
+    strong = [s for s in scores.values() if s is not None and abs(s) >= STRONG_PAIR]
+    if len(strong) < 3:
+        return 0
+    pos = sum(1 for s in strong if s > 0)
+    if pos >= 0.75 * len(strong):
+        return 1
+    if len(strong) - pos >= 0.75 * len(strong):
+        return -1
+    return 0
+
+
+def decide_hole(groups, pair_scores, core_L, overrides=None):
+    """Dry/Wet for every photo of one hole.
+
+    groups:      {tray: [sources]}
+    pair_scores: {tray: score} for two-photo trays; > 0 means the first source
+                 in filename order is the brighter, i.e. dry, shot
+    core_L:      {source: median L} for trays without exactly two photos
+    overrides:   {source: "Dry"|"Wet"} set by the user; always wins
+
+    Returns ({source: condition}, {tray: dict(confidence, basis, score)}).
+
+    A clear brightness difference decides a tray. A near-tie does not - it
+    follows the hole's own shooting order (see `shooting_order`) and is marked
+    "check", so it is never presented as certain. A clear decision that goes
+    AGAINST the hole's order is kept, because crews do sometimes shoot wet
+    first (DD26ZOP-006 tray 25), but it is marked "check" too. On 114 verified
+    trays this gets 113 right and flags the one it gets wrong.
+    """
+    overrides = overrides or {}
+    order = shooting_order(pair_scores)
+    conds, info = {}, {}
+    for tray, srcs in groups.items():
+        srcs = sorted(srcs)
+        given = {s: overrides[s] for s in srcs if s in overrides}
+        score = pair_scores.get(tray) if len(srcs) == 2 else None
+        if len(srcs) == 2 and len(given) == 1:
+            # one shot set by hand: the other is the other condition
+            s, c = next(iter(given.items()))
+            other = srcs[1] if s == srcs[0] else srcs[0]
+            given[other] = "Wet" if c == "Dry" else "Dry"
+        if len(given) == len(srcs):
+            for s in srcs:
+                conds[s] = given[s]
+            info[tray] = dict(confidence="high", basis="set by hand", score=score)
+            continue
+        if score is None:
+            c, margin = decide_conditions(srcs, core_L, given)
+            conds.update(c)
+            info[tray] = dict(confidence="high" if margin >= DRY_WET_MARGIN else "check",
+                              basis="brightness" if len(srcs) > 1 else "single photo",
+                              score=margin)
+            continue
+        if abs(score) >= STRONG_PAIR:
+            first_dry = score > 0
+            agrees = order == 0 or (order > 0) == first_dry
+            conf = "high" if agrees else "check"
+            basis = "brightness" if agrees else "brightness, against the hole's shooting order"
+        elif order != 0:
+            first_dry, conf, basis = order > 0, "check", "shooting order (too close to call)"
+        else:
+            first_dry, conf, basis = score >= 0, "check", "brightness (too close to call)"
+        conds[srcs[0]] = "Dry" if first_dry else "Wet"
+        conds[srcs[1]] = "Wet" if first_dry else "Dry"
+        info[tray] = dict(confidence=conf, basis=basis, score=score)
+    return conds, info
 
 
 def chain_depths(trays, ends, first_start):
