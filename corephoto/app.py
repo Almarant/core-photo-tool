@@ -626,9 +626,11 @@ class App(_Root):
         nfit = sum(1 for d in det.values() if d.get("fit"))
         if fitted:
             self.params.tray_aspect = fitted
+            nbar = sum(1 for d in det.values() if d.get("level") == "bar")
             self.say(f"Tray edges found on each photo's own tray in {nfit} of "
-                     f"{len(det)} photos (pale cover); crops follow each tray, at "
-                     f"one shape ({fitted:.2f}) and one scale for the batch.")
+                     f"{len(det)} photos (pale cover); those crops run from the "
+                     f"top of the label bar to the tray's base, at one scale for "
+                     f"the batch. {nbar} photos levelled on the label bar.")
         elif len(good) >= 3:
             self.params.tray_aspect = float(np.median(good))
             self.say(f"Tray shape measured at {self.params.tray_aspect:.2f} "
@@ -955,7 +957,9 @@ class App(_Root):
         crop, gains = core.render(p, d, pr, self._cur_adj(p), prof=self._prof(p))
         self._img2 = cv_to_tk(crop, 540, 400)
         self.cv_res.configure(image=self._img2)
-        msg = (f"tilt {d['angle']:+.2f}°    tray found by {d.get('mask_method','?')}"
+        msg = (f"tilt {d['angle']:+.2f}° (levelled on the "
+               f"{'label bar' if d.get('level') == 'bar' else 'tray rail'})"
+               f"    tray found by {d.get('mask_method','?')}"
                f"    shape {d.get('tray_aspect','?')}"
                f"{'' if d.get('aspect_ok', True) else ' (WRONG SHAPE - check this box)'}"
                f"    output {crop.shape[1]}×{crop.shape[0]} px")
@@ -1252,6 +1256,8 @@ class App(_Root):
                         dry_wet_basis=info["basis"],
                         core_L=round(self.core_L.get(s, 0), 1),
                         tilt_deg=round(d["angle"], 2),
+                        levelled_on=d.get("level", "rail"),
+                        crop_fitted=int(bool(d.get("fit"))),
                         bar_method=d.get("bar_method", ""),
                         mask_method=d.get("mask_method", ""),
                         tray_aspect=d.get("tray_aspect", ""),

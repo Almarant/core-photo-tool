@@ -287,9 +287,11 @@ def test_one_corrected_box_calibrates_the_rest_of_the_folder():
         f"calibrating on one photo missed the next by {err:.0f} px "
         f"({100 * err / width:.1f}% of tray width)")
 
-    # the automatic box on B is the thing this replaces - it must be worse,
-    # or the calibration is not earning its place
-    auto = core.crop_box(b, p)
+    # the batch box on B is the thing this replaces - it must be worse, or
+    # the calibration is not earning its place. (Since 1.7.2 some photos on
+    # this rig get a box fitted to their own tray instead, when enough of the
+    # batch does; the batch box is what the rest of them still get.)
+    auto = core.crop_box(dict(b, fit=None), p)
     auto_err = max(abs(auto[i] - want_b[i]) for i in range(4))
     assert auto_err > err, (
         f"automatic detection ({auto_err:.0f} px) is no longer worse than "
@@ -329,8 +331,11 @@ def test_locking_the_shape_gives_one_canvas_for_a_whole_batch():
     framed differently must still come out on the same canvas."""
     p = core.Params()
     assert p.lock_aspect, "the lock is the mechanism; it must default on"
-    a = core.detect_image(_fixture("covered_bench.png"), p)
-    b = core.detect_image(_fixture("dry_tiles.jpg"), p)
+    # Photos WITHOUT a box fitted to their own tray, as on a rig where
+    # `settle_fits` drops the fits; a fitted box keeps its own height (see
+    # test_a_fitted_crop_keeps_its_own_height).
+    a = dict(core.detect_image(_fixture("covered_bench.png"), p), fit=None)
+    b = dict(core.detect_image(_fixture("dry_tiles.jpg"), p), fit=None)
     # same batch settings => identical canvas, whatever each photo's own
     # detected bottom happened to be
     assert a["bb"][3] != b["bb"][3], "fixtures no longer differ; test is vacuous"
@@ -547,7 +552,7 @@ def test_the_crop_follows_this_photos_own_tray():
     d = core.detect_image(_fixture("pale_cover_tray.jpg"))
     p = core.Params()
     l, t, r, b = core.crop_box(d, p)
-    want_l, want_r = 52 - p.pad_x, 725 + p.pad_x
+    want_l, want_r = 52, 725
     tol = 0.01 * (want_r - want_l)
     assert abs(l - want_l) <= tol and abs(r - want_r) <= tol, (l, r)
 
@@ -588,3 +593,93 @@ def test_fits_are_dropped_on_a_rig_without_a_pale_cover():
     dets = {i: dict(bar=100, fit=None) for i in range(10)}
     dets[0]["fit"] = (10, 700, 360)
     assert core.settle_fits(dets) is None and dets[0].get("fit") is None
+
+
+# ------------------------------------------------------------ 1.7.2: crops
+# Reference boxes: DD26ZOP-028 as cropped by hand-tuned script and accepted
+# by Demur on 2026-11-19 ("perfect cropping"), in 1/8-scale px of the frame
+# levelled on the bar. Fixtures are 1/8 scale unless named _quarter.
+CROP_028 = {
+    "bar_vs_rail.jpg": dict(angle=0.10, box=(13.0, 155.0, 742.0, 398.5)),       # IMG_1758
+    "pale_core_bottom.jpg": dict(angle=-0.39, box=(11.5, 163.5, 738.0, 407.5)),  # IMG_1803
+    "shaded_side.jpg": dict(angle=0.10, box=(18.5, 160.0, 738.0, 404.0)),        # IMG_1805
+}
+
+
+def test_the_crop_is_levelled_on_the_label_bar():
+    """DD26ZOP-028 IMG_1758: the tray's bottom rail says 1.34 deg, the label
+    bar 0.10. 1.7.1 levelled on the rail, so the bar ran downhill across the
+    crop - 140 px from end to end at full size."""
+    s = _fixture("bar_vs_rail.jpg")
+    d = core.detect_image(s, fine=_fixture("bar_vs_rail_quarter.jpg"))
+    assert d["level"] == "bar", d["level"]
+    assert abs(d["angle"] - 0.10) <= 0.10, d["angle"]
+    # from the 1/8 frame alone it is coarser, but still on the bar
+    for name in ("bar_vs_rail.jpg", "pale_core_bottom.jpg"):
+        d = core.detect_image(_fixture(name))
+        want = CROP_028[name]["angle"]
+        assert abs(d["angle"] - want) <= 0.25, (name, d["angle"], want)
+
+
+def test_the_crop_starts_at_the_top_edge_of_the_bar():
+    """The tile reading sits 13 px (1/8 scale) above the bar, padded upward by
+    3/4 of a tile; 1.7.1 started the crop there, so ~100 full-size px of cover
+    showed above every tray. The crop must start at the bar's own edge."""
+    p = core.Params()
+    for name, ref in CROP_028.items():
+        d = core.detect_image(_fixture(name))
+        top = core.crop_box(d, p)[1]
+        assert abs(top - ref["box"][1]) <= 1.0, (name, top, ref["box"][1])
+        assert top > d["bar"] + 3, (name, "still at the tile reading", top, d["bar"])
+
+
+def test_pale_core_does_not_stop_the_bottom_short():
+    """IMG_1803: pale core in the bottom row. 1.7.1 walked down from a fixed
+    fraction of the tray height to the first pale rows, found the core, and
+    put the bottom 50 px (1/8 scale) inside the tray."""
+    d = core.detect_image(_fixture("pale_core_bottom.jpg"))
+    assert d["fit"] is not None
+    want = CROP_028["pale_core_bottom.jpg"]["box"][3]
+    assert abs(d["fit"][2] - want) <= 1.5, (d["fit"][2], want)
+
+
+def test_a_side_in_shadow_is_still_found():
+    """IMG_1805: the cover left of the tray is in shadow (L* 135, under the
+    bright-cover threshold), so 1.7.1 found no tray edge on that side and
+    fitted nothing. The edge is where the tray wall steps up onto the cover."""
+    d = core.detect_image(_fixture("shaded_side.jpg"))
+    assert d["fit"] is not None
+    want = CROP_028["shaded_side.jpg"]["box"]
+    assert abs(d["fit"][0] - want[0]) <= 1.5 and abs(d["fit"][1] - want[2]) <= 1.5, d["fit"]
+
+
+def test_a_fitted_crop_keeps_its_own_height():
+    """With the batch shape locked, 1.7.1 gave every fitted photo the tallest
+    tray's height, so most showed cover under the tray. A photo whose own
+    tray was fitted keeps its own bottom; the lock is for the others."""
+    p = core.Params(lock_aspect=True, tray_aspect=2.80)
+    d = dict(bb=(10, 160, 740, 400), bar=150, edge=158.5, fit=(12.0, 741.0, 401.5))
+    l, t, r, b = core.crop_box(d, p)
+    assert (l, t, r, b) == (12.0, 158.5, 741.0, 401.5), (l, t, r, b)
+    w, h = core.out_size(d, p)
+    assert w == core.OUT_WIDTH and abs(w / h - (r - l) / (b - t)) < 0.01
+
+
+def test_the_bar_edge_is_not_read_off_the_lettering():
+    """DD26ZOP-021 IMG_1597: the stencil tiles sit high on the bar, and the
+    bottom of a white tile on the dark bar is a stronger step than the cover
+    onto the bar. Taking the strongest step put a third of the points on the
+    lettering and the fit nowhere; the bar's top edge was checked by eye at
+    167.5 (1/8 scale)."""
+    d = core.detect_image(_fixture("tiles_high_on_bar.jpg"))
+    assert d["level"] == "bar" and d["edge"] is not None
+    assert abs(d["edge"] - 167.5) <= 1.5, d["edge"]
+
+
+def test_leaves_printed_on_the_cover_are_not_the_bar():
+    """DD26ZOP-026 IMG_1681: leaves printed on a cover in shade. The first
+    step down each column is as often a leaf as the bar, and the bar's own
+    step is weak. Top edge checked by eye on the levelled crop at 159.5."""
+    d = core.detect_image(_fixture("leaves_above_bar.jpg"))
+    assert d["level"] == "bar" and d["edge"] is not None
+    assert abs(d["edge"] - 159.5) <= 1.5, d["edge"]

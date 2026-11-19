@@ -51,6 +51,10 @@ class Params:
     # (median error measured at 0-3 px) and buys an identical canvas for every
     # photo in a batch, which is what makes a set usable side by side.
     lock_aspect: bool = True
+    # Margin, in 1/8-scale px, added around a crop that was fitted to this
+    # photo's own tray (`fit_tray`). The fitted edges already take in about
+    # 1 px (8 full-size px) of cover; 0 keeps them exactly as found.
+    fit_pad: float = 0.0
 
     @property
     def scale(self):
@@ -285,7 +289,174 @@ def _first_run(arr, cond, start, step, n):
     return None
 
 
-def fit_tray(s, bb, bar):
+def _lum(img, k=1):
+    return cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32),
+                            (5, 5) if k > 1 else (3, 3), 0)
+
+
+BAR_STEP = 30.0     # L* drop from the cover onto the rusty bar that counts as its edge
+BAR_STEP_WEAK = 20.0  # ...where the cover is in shadow (DD26ZOP-026 IMG_1679-1683)
+
+
+def bar_edge(img, bb, bar, k=1):
+    """The top edge of the label bar, fitted as a straight line.
+
+    `barfind` places the bar from its stencil tiles, padded upward by 3/4 of a
+    tile, so its answer sits about 13 px (1/8 scale) - 100 px at full size -
+    ABOVE the bar. That margin of cover is what made the top of every crop
+    look loose. And the tray is levelled on its bottom rail, which on
+    DD26ZOP-028 differed from the bar by up to 1.1 deg, so the bar ran visibly
+    downhill across the crop.
+
+    Where the bar sits against something brighter than itself (a pale cover)
+    its own top edge can be measured directly: the bright-to-dark steps
+    below the tile reading in ~120 columns, the straight line through most of
+    them, then a trimmed fit to the strongest step along that line. `img` is at `k` times the detection scale (k=2 for a
+    1/4-scale decode); `bb` and `bar` are in detection px, and so is `top`.
+
+    Returns dict(slope, top, n, resid) or None. `slope` is in this frame;
+    `top` is where the highest stretch of the edge lies, less half a detection
+    px.
+    """
+    H, W = img.shape[:2]
+    L = _lum(img, k)
+    xs = np.unique(np.linspace(max(bb[0] * k + 10, 2), min(bb[2] * k - 10, W - 3),
+                               120).astype(int))
+    if len(xs) < 40:
+        return None
+    C = (L[:, xs - 1] + L[:, xs] + L[:, xs + 1]) / 3.0
+    cs = np.vstack([np.zeros((1, C.shape[1]), np.float32), np.cumsum(C, 0)])
+    a4, a1, b1, b5 = 4 * k, k, k, 5 * k
+    ya = max(int((bar - 6) * k), a4 + 1)
+    yb = min(int((bar + 27.5) * k), H - b5 - 2)
+    if yb - ya < 4:
+        return None
+    ys = np.arange(ya - 1, yb + 1)
+    up = (cs[ys - a1 + 1] - cs[ys - a4 + 1]) / (a4 - a1)        # rows y-4k .. y-k
+    dn = (cs[ys + b5] - cs[ys + b1]) / (b5 - b1)                # rows y+k .. y+5k
+    sc = np.where(dn < 135, up - dn, -1e9)
+
+    def peak(i, j):
+        """Sub-pixel position of the step peak at row index i, column j."""
+        a, b, c = sc[i - 1, j], sc[i, j], sc[i + 1, j]
+        den = a - 2 * b + c
+        off = 0.5 * (a - c) / den if (den < 0 and a > -1e8 and c > -1e8) else 0.0
+        return ys[i] + float(np.clip(off, -0.5, 0.5))
+
+    def line(pts):
+        if len(pts) < 40:
+            return None
+        P = np.array(pts, float)
+        px, py = P[:, 0], P[:, 1]
+        keep = np.ones(len(P), bool)
+        for _ in range(4):
+            a = np.polyfit(px[keep], py[keep], 1)
+            r = py - np.polyval(a, px)
+            keep = np.abs(r) < max(k, 2.5 * float(np.median(np.abs(r[keep]))))
+            if keep.sum() < 40:
+                return None
+        a = np.polyfit(px[keep], py[keep], 1)
+        return a, px, py, py - np.polyval(a, px), keep
+
+    # Find the edge first as the straight line through the most columns'
+    # step peaks - every peak, not one per column. One peak per column does
+    # not work: the strongest is often the bottom of a white stencil tile
+    # (DD26ZOP-021, where the tiles sit high on the bar), and the first is
+    # often a leaf printed on the cover (DD26ZOP-026 IMG_1681, 1683). The
+    # bar's own top edge is the one line that runs the whole width.
+    tmax = np.tan(np.radians(MAX_TILT_DEG))
+
+    def ransac(thr):
+        pk = (sc[1:-1] > thr) & (sc[1:-1] >= sc[:-2]) & (sc[1:-1] > sc[2:])
+        cand = [(j, x, peak(i + 1, j)) for j, x in enumerate(xs)
+                for i in np.nonzero(pk[:, j])[0]]
+        if len(cand) < 40:
+            return None
+        cj = np.array([c[0] for c in cand]); cx = np.array([c[1] for c in cand], float)
+        cy = np.array([c[2] for c in cand])
+        pairs = np.random.default_rng(0).integers(0, len(cand), size=(400, 2))
+        best = None
+        for p, q in pairs:
+            if cx[p] == cx[q]:
+                continue
+            sl = (cy[q] - cy[p]) / (cx[q] - cx[p])
+            if abs(sl) > tmax:
+                continue
+            inl = np.abs(cy - (cy[p] + sl * (cx - cx[p]))) <= 1.0 * k
+            key = (len(np.unique(cj[inl])), -(cy[p] + sl * (0.5 * W - cx[p])))
+            if best is None or key > best[0]:
+                best = (key, inl)
+        if best is None or best[0][0] < 40:
+            return None
+        return cj, cx, cy, best[1]
+
+    # Weak steps only where there are not enough strong ones: a weak step is
+    # as often the shading across the cover as the bar's edge.
+    got = ransac(BAR_STEP) or ransac(BAR_STEP_WEAK)
+    if got is None:
+        return None
+    cj, cx, cy, inl = got
+    # That line is only the seed: it may follow one stretch of a bar that is
+    # not quite straight. The trimmed fit through each column's peak nearest
+    # to it, within 4k, follows the whole bar.
+    a0 = np.polyfit(cx[inl], cy[inl], 1)
+    d0 = np.abs(cy - np.polyval(a0, cx))
+    near = {}
+    for j, x, y, dd in zip(cj, cx, cy, d0):
+        if dd <= 4 * k and (j not in near or dd < near[j][2]):
+            near[j] = (x, y, dd)
+    first = line([(x, y) for x, y, _ in near.values()])
+    if first is None:
+        return None
+    # Then the strongest step within 2k of that line, for the precise points.
+    a0 = first[0]
+    pts = []
+    for j, x in enumerate(xs):
+        yl = np.polyval(a0, x)
+        lo = max(int(np.searchsorted(ys, yl - 2 * k)), 1)
+        hi = min(int(np.searchsorted(ys, yl + 2 * k)) + 1, len(ys) - 1)
+        if hi - lo < 1:
+            continue
+        i = lo + int(np.argmax(sc[lo:hi, j]))
+        pts.append((x, peak(i, j), sc[i, j]))
+    strong = [(x, y) for x, y, v in pts if v > BAR_STEP]
+    fit = line(strong if len(strong) >= 60 else [(x, y) for x, y, v in pts if v > BAR_STEP_WEAK])
+    if fit is None:
+        return None
+    a, px, py, r, keep = fit
+    if px[keep].max() - px[keep].min() < 0.6 * (bb[2] - bb[0]) * k:
+        return None
+    # The edge points themselves, not the line, set the top: a bar that bows
+    # or kinks (DD26ZOP-028 IMG_1798 rises 15 px, 1/4 scale, mid-length) must
+    # not lose its highest stretch to a straight line through the rest.
+    # So: the highest step peak in each column from 4k above the line to k
+    # below it, and the 5th percentile of those.
+    rc = cy - np.polyval(a, cx)
+    w_ = (rc >= -4 * k) & (rc <= k)
+    hi_ = {}
+    for j, y in zip(cj[w_], cy[w_]):
+        hi_[j] = min(y, hi_.get(j, y))
+    top = (float(np.percentile(list(hi_.values()), 5)) - 0.5 * k) / k
+    return dict(slope=float(a[0]), top=top, n=int(keep.sum()),
+                resid=float(np.median(np.abs(r[keep]))) / k)
+
+
+def _wall_edge(band, lo, hi, right, k):
+    """Where the tray's outer wall meets the cover, when the cover is in shade.
+
+    The bright-run test needs cover above BENCH_L; in shadow at the edge of
+    the frame it is not (L* 135 beside DD26ZOP-028 IMG_1805). Take instead the
+    strongest step from the wall up onto anything cover-like."""
+    n = 3 * k
+    best, at = 0.0, None
+    for i in range(max(lo, 0), min(hi, len(band)) - n):
+        inner, outer = (band[i], band[i + n]) if right else (band[i + n], band[i])
+        if outer >= 125 and inner < 135 and outer - inner > best:
+            best, at = float(outer - inner), i + n / 2.0
+    return at if best >= 20 else None
+
+
+def fit_tray(s, bb, bar, k=1, strict=False):
     """This photo's own tray edges, where the tray sits on a pale cover.
 
     The crop used one width for the whole batch - the median of the detected
@@ -297,36 +468,76 @@ def fit_tray(s, bb, bar):
 
     On a pale cover the edges can be found directly: walk out from the middle
     of the tray along the rows below the bar until the cover starts, and down
-    until it starts again under the bottom rail. Returns (x0, x1, y1) in the
-    deskewed 1/8-scale frame, or None when no pale cover is found on BOTH sides
-    (a side may instead run off the frame) - on those rigs (teal trays on
-    concrete, DD_ZOP_014/015) the batch-width crop is kept, as before.
+    past the tray's bottom rail until it starts again. `s` is at `k` times
+    detection scale; `bb` and `bar` (the top of the bar) are in detection px.
+    Returns (x0, x1, y1) in detection px, each taking in about 8 full-size px
+    of cover, or None when no cover is found on a side that does not run off
+    the frame - on those rigs (teal trays on concrete, DD_ZOP_014/015) the
+    batch-width crop is kept, as before.
+
+    The bottom used to be the first pale rows below a fixed fraction of the
+    tray height. Pale core reaches that far: on DD26ZOP-028 IMG_1796, 1803,
+    1805 and 1806 the walk stopped inside the tray. It now starts from the
+    darkest row below the last core row - the shadow under the tray's inner
+    rail - and no core can sit below that.
+
+    A side whose cover is in shade, or that runs off the frame, is accepted
+    only when the bar's own top edge was measured (`bar_edge`), which needs a
+    pale surface behind the bar. `strict` says it was not: then both sides
+    must find bright cover, as in 1.7.1, or a teal tray on concrete (UG_ZOP)
+    fits by accident on a third of its photos.
     """
     H, W = s.shape[:2]
-    w0 = max(bb[2] - bb[0], 1)
-    ya, yb = int(bar + 0.035 * w0), int(min(H - 1, bar + 0.28 * w0))
-    if yb - ya < 20:
+    w0 = max(bb[2] - bb[0], 1) * k
+    top = bar * k
+    ya, yb = int(top + 0.027 * w0), int(min(H - 1, top + 0.26 * w0))
+    if yb - ya < 20 * k:
         return None
-    L = cv2.GaussianBlur(cv2.cvtColor(s, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32),
-                         (3, 3), 0)
-    col = np.median(L[ya:yb], axis=0)
-    xc = int(0.5 * (bb[0] + bb[2]))
+    L = _lum(s, k)
+    band = np.median(L[ya:yb], axis=0)
+    xc = int(0.5 * (bb[0] + bb[2]) * k)
     bright = lambda v: v > BENCH_L
-    r = _first_run(col, bright, xc, +1, 6)
-    lft = _first_run(col, bright, xc, -1, 6)
-    x1 = r - 1 if r is not None else W - 1
-    x0 = lft + 1 if lft is not None else 0
-    # A side that found no cover must genuinely run off the frame.
-    if (r is None and bb[2] < W - 3) or (lft is None and bb[0] > 2):
+    r = _first_run(band, bright, xc, +1, 6 * k)
+    lft = _first_run(band, bright, xc, -1, 6 * k)
+    x0 = lft + 1 - k if lft is not None else None
+    x1 = r + k if r is not None else None
+    if strict and (x0 is None or x1 is None):
         return None
-    if r is None and lft is None:
+    if x0 is None:
+        e = _wall_edge(band, 0, 40 * k, False, k)
+        x0 = e - 0.5 * k if e is not None else None
+    if x1 is None:
+        e = _wall_edge(band, W - 40 * k, W, True, k)
+        x1 = e + 0.5 * k if e is not None else None
+    # A side that found no cover must genuinely run off the frame: the tray
+    # box reaches the edge, or the frame's own edge column is still tray wall
+    # (DD26ZOP-028 IMG_1807, where the box stopped 15 px short of it).
+    off_l = bb[0] <= 2 or float(np.mean(band[:2 * k])) < 125
+    off_r = bb[2] >= W / k - 3 or float(np.mean(band[-2 * k:])) < 125
+    if (x1 is None and not off_r) or (x0 is None and not off_l):
         return None
+    if x0 is None and x1 is None:
+        return None
+    x0 = max(x0, 0) if x0 is not None else 0
+    x1 = min(x1, W) if x1 is not None else W
     if not 0.85 <= (x1 - x0) / w0 <= 1.15:
         return None
-    rows = np.median(L[:, x0 + 15:x1 - 15], axis=1)
-    b = _first_run(rows, lambda v: v > BENCH_L - 5, int(bar + 0.25 * (x1 - x0)), +1, 8)
-    y1 = b - 1 if b is not None else H - 1
-    return (int(x0), int(x1), int(y1))
+    rows = np.median(L[:, int(x0) + 20 * k:int(x1) - 20 * k], axis=1)
+    s0 = int(top + 0.29 * (x1 - x0))
+    if s0 + 30 * k >= H:
+        return None
+    m = s0 + int(np.argmin(rows[s0:s0 + 30 * k]))
+    y1 = H
+    for y in range(m, min(H - 2 * k, m + 45 * k)):
+        if np.all(rows[y:y + 2 * k] > 145):
+            y1 = y + 0.5 * k
+            break
+    return (float(x0) / k, float(x1) / k, float(y1) / k)
+
+
+def _anchor(d):
+    """Top of the tray as measured: the bar's own edge where it was found."""
+    return d["edge"] if d.get("edge") is not None else d["bar"]
 
 
 def settle_fits(dets, tol=0.10):
@@ -340,7 +551,7 @@ def settle_fits(dets, tol=0.10):
     loses its bottom rail; the others take in a sliver of cover below it.
     Returns None when the batch is not a pale-cover rig (see below).
     """
-    shapes = {k: (d["fit"][1] - d["fit"][0]) / max(d["fit"][2] - d["bar"], 1)
+    shapes = {k: (d["fit"][1] - d["fit"][0]) / max(d["fit"][2] - _anchor(d), 1)
               for k, d in dets.items() if d.get("fit")}
     # A rig with a pale cover fits on most photos (42-48 of 44-56 on DD26ZOP
     # 021/026/027); a teal tray on concrete fits only by accident (2 of 28 on
@@ -361,7 +572,7 @@ def settle_fits(dets, tol=0.10):
     return min(good) if good else None
 
 
-def detect_image(s, p: Params = None):
+def detect_image(s, p: Params = None, fine=None):
     """Detection on an already-decoded 1/8-scale frame.
 
     Two segmentations are tried, because no single one covers the rigs this is
@@ -375,6 +586,12 @@ def detect_image(s, p: Params = None):
     Split out from `detect` so the tests can ship 1/8-scale fixtures - a few
     tens of KB each instead of a few hundred - and still exercise the real tray
     finder, deskew and bar detection rather than only the pure logic.
+
+    `fine`, the same photo decoded at 1/4 scale, is optional: with it the bar
+    angle, the bar edge and the tray edges are measured at twice the
+    resolution. At 1/8 the bar angle comes out within about 0.2 deg of the
+    1/4-scale answer; that is 20 full-size px from one end of the bar to the
+    other, which is visible, so `detect` always passes it.
     """
     if s is None:
         return None
@@ -387,17 +604,14 @@ def detect_image(s, p: Params = None):
     mask_method, best = min(cands, key=lambda t: t[1]["err"])
     aspect_ok = best["shape_err"] <= p.aspect_tol
     m, bb = best["mask"], best["bb"]
+    s0, m0 = s, m
     ang = tilt(m, *bb)
     # Find the bar BEFORE rotating as well as after: rotating the frame can
     # hide the tile row from the finder (IMG_0140 and IMG_0149 both lost their
     # label that way), so the pre-rotation answer has to stay in play.
     pre_y, pre_bot, pre_method, pre_strength = barfind.find(s, bb)
     if abs(ang) > 0.05:
-        h, w = m.shape
-        R = cv2.getRotationMatrix2D((w / 2, h / 2), ang, 1.0)
-        s = cv2.warpAffine(s, R, (w, h))
-        m = cv2.warpAffine(m, R, (w, h), flags=cv2.INTER_NEAREST)
-        bb = band(m) or bb
+        s, m, bb = _rotated(s0, m0, ang, bb)
     else:
         ang = 0.0
     bt, bbot, strength, method = bar_top(s, bb)
@@ -405,19 +619,76 @@ def detect_image(s, p: Params = None):
     # "whichever sits higher" is not a tie-break, it is how a bad reading wins.
     if method != "tiles" and pre_method == "tiles":
         bt, bbot, method, strength = pre_y, pre_bot, pre_method, pre_strength
+    edge, level, fine_r, k = None, "rail", None, 1
+    if method in ("tiles", "gradient"):
+        # Level on the label bar where its edge can be measured (see
+        # `bar_edge`), on the finer decode when there is one.
+        k = 2 if fine is not None else 1
+        src = fine if fine is not None else s0
+        # A bar that is not quite straight changes which points the trimmed
+        # fit keeps once the frame turns, so one pass can leave 0.6 deg on it
+        # (IMG_1798); repeat until the bar is level in the frame it is cut from.
+        rail = (s, m, bb)
+        a_try, e = ang, None
+        for _ in range(4):
+            f_try = _rot(src, a_try)
+            e = bar_edge(f_try, bb, bt, k)
+            if e is None or e["resid"] > 1.5:
+                e = None
+                break
+            d_a = float(np.degrees(np.arctan(e["slope"])))
+            if abs(d_a) < 0.03:
+                break
+            a_try += d_a
+            if abs(a_try) > MAX_TILT_DEG:
+                e = None
+                break
+            s, m, bb = _rotated(s0, m0, a_try, bb)
+        else:
+            f_try = _rot(src, a_try)
+            e = bar_edge(f_try, bb, bt, k)
+        if e is not None:
+            ang, level, fine_r = a_try, "bar", f_try
+            if abs(e["top"] - bt) < 27:
+                edge = e["top"]
+        else:
+            s, m, bb = rail
     x0, y0, x1, y1 = bb
-    fit = fit_tray(s, bb, bt) if method in ("tiles", "gradient") else None
+    fit = None
+    if method in ("tiles", "gradient"):
+        top = edge if edge is not None else bt
+        if fine_r is None and fine is not None:
+            fine_r = _rot(fine, ang)
+        fit = (fit_tray(fine_r, bb, top, k, strict=edge is None) if fine_r is not None
+               else fit_tray(s, bb, top, strict=edge is None))
     return dict(small=s, bb=bb, angle=ang, bar=bt, bar_bot=bbot,
                 bar_strength=strength, bar_method=method, tray_px=int(x1 - x0),
                 mask_method=mask_method, tray_aspect=round(best["aspect"], 2),
-                aspect_ok=bool(aspect_ok), fit=fit,
+                aspect_ok=bool(aspect_ok), fit=fit, edge=edge, level=level,
                 cut_left=int(x0 <= 2), cut_right=int(x1 >= s.shape[1] - 3))
+
+
+def _rot(img, ang):
+    if abs(ang) < 1e-6:
+        return img
+    h, w = img.shape[:2]
+    return cv2.warpAffine(img, cv2.getRotationMatrix2D((w / 2, h / 2), ang, 1.0), (w, h))
+
+
+def _rotated(s, m, ang, bb):
+    """Frame and tray mask deskewed by `ang`, and the tray box found again."""
+    h, w = m.shape
+    R = cv2.getRotationMatrix2D((w / 2, h / 2), ang, 1.0)
+    s = cv2.warpAffine(s, R, (w, h))
+    m = cv2.warpAffine(m, R, (w, h), flags=cv2.INTER_NEAREST)
+    return s, m, (band(m) or bb)
 
 
 def detect(path, p: Params = None):
     """Returns dict(small, bb, angle, bar, bar_method, bar_strength,
     tray_px, cut_left, cut_right) or None."""
-    return detect_image(imread(path, cv2.IMREAD_REDUCED_COLOR_8), p)
+    return detect_image(imread(path, cv2.IMREAD_REDUCED_COLOR_8), p,
+                        fine=imread(path, cv2.IMREAD_REDUCED_COLOR_4))
 
 
 def manual_detect(path):
@@ -441,17 +712,23 @@ def manual_detect(path):
 def crop_box(d, p: Params):
     """Auto-detected crop rectangle, in detection-pixel coordinates.
 
-    With a per-photo fit (`fit_tray`) the box spans this photo's own tray;
-    otherwise the batch width is centred on the detected tray, as before.
+    With a per-photo fit (`fit_tray`) the box is this photo's own tray: from
+    the top edge of the label bar to the cover under the bottom rail, wall to
+    wall. Its height is the tray's own, not the batch shape - those boxes
+    have already been checked against the batch in `settle_fits`, and locking
+    them to the tallest shape is what left cover showing under most trays.
+
+    Otherwise the batch width is centred on the detected tray, as before, with
+    the height from the batch shape when `lock_aspect` is on.
     """
     x0, y0, x1, y1 = d["bb"]
+    top = d["edge"] - p.fit_pad if d.get("edge") is not None else d["bar"] - p.pad_top
     if d.get("fit"):
-        left, right, y1 = d["fit"][0] - p.pad_x, d["fit"][1] + p.pad_x, d["fit"][2]
-    else:
-        xc = 0.5 * (x0 + x1)
-        left = xc - p.tray_width / 2 - p.pad_x
-        right = xc + p.tray_width / 2 + p.pad_x
-    top = d["bar"] - p.pad_top
+        fx0, fx1, fy1 = d["fit"]
+        return (fx0 - p.fit_pad, top, fx1 + p.fit_pad, fy1 + p.fit_pad)
+    xc = 0.5 * (x0 + x1)
+    left = xc - p.tray_width / 2 - p.pad_x
+    right = xc + p.tray_width / 2 + p.pad_x
     if p.lock_aspect and p.tray_aspect > 0:
         return (left, top, right, top + (right - left) / p.tray_aspect)
     return (left, top, right, y1 + p.pad_bottom)
